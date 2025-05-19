@@ -1,752 +1,475 @@
-# ION (Integrated Object Network) 使用指南
+# ION (Integrated Object Network) Guide
 
-## 简介
+## Table of Contents
+1. [Introduction](#introduction)
+2. [Installation](#installation)
+3. [Core Concepts](#core-concepts)
+4. [Basic Usage](#basic-usage)
+5. [Advanced Features](#advanced-features)
+6. [Performance Optimization](#performance-optimization)
+7. [API Reference](#api-reference)
+8. [Usage Examples](#usage-examples)
+9. [Best Practices](#best-practices)
 
-ION (Integrated Object Network) 是一个强大的高级数据结构，结合了对象网络数据库（OND）和组合数据结构的功能，提供了丰富的对象网络操作能力。ION 适用于需要处理复杂对象关系网络的应用场景，如知识图谱、社交网络分析、推荐系统等。
+## Introduction
 
-### 主要特点
+ION (Integrated Object Network) is a powerful data structure designed for efficient in-memory graph-based data management. It combines features from both OND and ICombinedDataStructure to provide a versatile platform for complex data operations.
 
-- **高效的节点和关系管理**：支持快速创建、更新、删除和查询节点及其关系
-- **强大的索引机制**：提供元数据索引、标签索引、值类型索引和复合索引
-- **完整的事务支持**：支持ACID事务，提供不同隔离级别
-- **并发控制机制**：支持乐观和悲观并发控制
-- **性能优化功能**：批量索引更新、智能线程池管理、缓存机制等
-- **高级查询能力**：A*搜索、路径查找、模糊搜索等
+### Key Features
 
-## 安装和依赖
+- **Fast retrieval**: Optimized hash-based key-value storage
+- **Relationship management**: Create and manage complex relationships between data nodes
+- **Metadata indexing**: Index and query nodes by metadata attributes
+- **Transaction support**: ACID-compliant transaction processing
+- **Advanced path finding**: Efficient algorithms for finding paths between nodes
+- **Concurrency control**: Thread-safe operations with fine-grained locking
+- **Large dataset support**: Partitioning strategies and memory optimization
+- **Event system**: Callback mechanisms for various operations
+- **Batch processing**: Efficient handling of bulk operations
 
-ION 依赖以下模块：
+## Installation
 
-```python
-import hashlib
-import pickle
-import threading
-import concurrent.futures
-import json
-import base64
-import os
-import re
-import difflib
-import heapq
-import time
-import uuid
-import logging
-import weakref
-import functools
-from enum import Enum
-from typing import Any, Dict, List, Optional, Set, Tuple, Union, Callable
-from collections import deque, Counter, defaultdict
-
-# 导入bsd模块中的组件
-from bsd import ICombinedDataStructure, HashTable, NestedBidirectionalMap, RelationshipChain
-
-# 导入ond模块中的组件
-from ond import RNode, obj_to_number
-
-```
-## 注：
-# 可以直接在<a>43.136.122.67:5003</a>访问ion官网
-在这里可以<strong>获得<strong>:
-* ion强大的大数据处理，图结构的类
-* pysti 实用数据库
-* bsd 整合多种高级类(ion官网可下载)
-* ond 强大图结构的类(ion官网可下载)
-* utils_wu 整合多种高级工具
-
-
-
-## 基本使用
-
-### 创建 ION 实例
+### Importing ION
 
 ```python
 from ion import ION
 
-# 创建默认 ION 实例
+# Create a basic ION instance
 ion = ION()
 
-# 创建带参数的 ION 实例
-ion = ION(
-    size=2048,  # 初始桶大小
-    max_workers=8,  # 并行处理的最大工作线程数
-    load_factor_threshold=0.7  # 触发扩容的负载因子阈值
+# Create an ION instance with custom settings for large datasets
+ion_large = ION(
+    size=100000,
+    max_workers=8,
+    load_factor_threshold=0.6,
+    large_dataset_mode=True,
+    partition_config={"strategy": "field", "field": "category"}
 )
 ```
 
-### 添加节点
+## Core Concepts
+
+### Nodes
+
+Nodes are the basic data elements in ION. Each node has:
+- A unique key
+- A value
+- Optional metadata (key-value pairs)
+- Optional tags
+- A weight value
+
+Nodes can be connected to other nodes through relationships.
+
+### Relationships
+
+Relationships define connections between nodes. They can have:
+- A relationship type
+- A weight
+- Optional metadata
+
+Relationships are directional (from source to target) and can be used to model various types of connections.
+
+### Indexes
+
+ION maintains several types of indexes to speed up queries:
+- **Key index**: Fast lookup by node key
+- **Value index**: Lookup by node value
+- **Metadata index**: Find nodes by metadata attributes
+- **Tag index**: Find nodes by tags
+- **Value type index**: Find nodes by value type
+- **Relationship type index**: Find nodes with specific relationship types
+- **Compound index**: Combine multiple criteria for complex queries
+
+### Partitions
+
+For large datasets, ION can distribute nodes across multiple partitions. Partitioning strategies include:
+- **Hash partitioning**: Based on key hash
+- **Field partitioning**: Based on a specific metadata field
+- **Range partitioning**: Based on numeric ranges
+
+## Basic Usage
+
+### Creating Nodes
 
 ```python
-# 创建简单节点
-node1 = ion.create_node("key1", "value1")
+# Create a simple node
+node1 = ion.create_node(key="user:1001", val="John Doe")
 
-# 创建带元数据的节点
-metadata = {"created_by": "user1", "importance": "high"}
-node2 = ion.create_node("key2", {"name": "Complex Value"}, metadata=metadata)
-
-# 创建带标签的节点
-node3 = ion.create_node("key3", 42, tags=["number", "important"])
-
-# 创建带权重的节点
-node4 = ion.create_node("key4", "weighted_value", weight=5.0)
+# Create a node with metadata and tags
+node2 = ion.create_node(
+    key="user:1002",
+    val="Jane Smith",
+    metadata={"age": 28, "status": "active"},
+    tags=["premium", "verified"]
+)
 ```
 
-### 添加关系
+### Retrieving Nodes
 
 ```python
-# 添加简单关系
-ion.add_relationship(node1, node2)
+# Get node by key
+node = ion.get_node_by_key("user:1001")
 
-# 添加带类型的关系
-ion.add_relationship(node1, node3, rel_type="belongs_to")
+# Get node by value
+node = ion.get_node_by_value("John Doe")
 
-# 添加带权重的关系
-ion.add_relationship(node2, node4, rel_type="references", rel_weight=2.5)
+# Find nodes by metadata
+active_users = ion.find_by_metadata("status", "active")
 
-# 添加带元数据的关系
-rel_metadata = {"created_at": "2023-06-15", "valid_until": "2024-06-15"}
-ion.add_relationship(node3, node4, rel_type="depends_on", metadata=rel_metadata)
+# Find nodes by tag
+premium_users = ion.find_by_tag("premium")
 ```
 
-## 节点操作
-
-### 获取节点
+### Managing Relationships
 
 ```python
-# 通过键获取节点
-node = ion.get_node_by_key("key1")
-
-# 通过值获取节点
-node = ion.get_node_by_value("value1")
-
-# 使用字典方式获取
-node = ion["key1"]  # 等同于 ion.get_node_by_key("key1")
-```
-
-### 更新节点
-
-```python
-# 更新节点值
-ion.update_node_value(node, "new_value")
-
-# 更新节点元数据
-new_metadata = {"updated_by": "user2", "status": "active"}
-ion.update_node_metadata(node, new_metadata)
-
-# 更新节点标签
-ion.update_node_tag(node, operation="add", tags=["new_tag"])
-ion.update_node_tag(node, operation="remove", tags=["old_tag"])
-ion.update_node_tag(node, operation="set", tags=["tag1", "tag2"], clear_existing=True)
-
-# 更新节点权重
-ion.update_node_weight(node, 3.5)
-```
-
-### 删除节点
-
-```python
-# 通过键删除节点
-removed_node = ion.remove_node_by_key("key1")
-
-# 使用字典方式删除
-del ion["key2"]
-```
-
-## 关系操作
-
-### 获取关系
-
-```python
-# 获取节点的所有关系目标
-related_nodes = node.get_relations()
-
-# 获取特定类型的关系目标
-related_nodes = node.get_relations(rel_type="belongs_to")
-```
-
-### 删除关系
-
-```python
-# 删除两个节点间的所有关系
-ion.remove_relationship(node1, node2)
-
-# 删除特定类型的关系
-ion.remove_relationship(node1, node3, rel_type="belongs_to")
-```
-
-## 查询操作
-
-### 基本查询
-
-```python
-# 通过元数据查询
-nodes = ion.find_by_metadata("status", "active")
-
-# 通过标签查询
-nodes = ion.find_by_tag("important")
-
-# 通过值类型查询
-nodes = ion.find_by_value_type("str")  # 查找值为字符串类型的节点
-```
-
-### 高级查询
-
-```python
-# 组合条件查询
-nodes = ion.advanced_search(
-    criteria=lambda x: isinstance(x, str) and "value" in x,  # 值匹配函数
-    metadata_filters={"status": "active"},  # 元数据过滤
-    tag_filters=["important"],  # 标签过滤
-    value_type="str",  # 值类型过滤
-    rel_type="belongs_to",  # 关系类型过滤
-    max_results=10  # 最大结果数
+# Add a relationship
+ion.add_relationship(
+    source="user:1001",
+    target="user:1002",
+    rel_type="follows",
+    rel_weight=1.0,
+    metadata={"since": "2023-05-15"}
 )
 
-# 复合索引查询
-# 先创建复合索引
-ion.create_compound_index(("tag", "metadata"))
-# 使用复合索引查询
-nodes = ion.compound_search(tag="important", metadata=("status", "active"))
+# Remove a relationship
+ion.remove_relationship("user:1001", "user:1002", rel_type="follows")
 
-# 模糊搜索
-results = ion.fuzzy_search("val",
-    search_in=["keys", "values", "metadata", "tags"],
-    max_results=20,
-    similarity_threshold=0.6,
-    case_sensitive=False
+# Find related nodes
+followers = ion.find_related("user:1002", rel_type="follows")
+```
+
+### Path Finding
+
+```python
+# Find a path between two nodes
+path = ion.search_path("user:1001", "user:1005")
+
+# Advanced path finding with A* algorithm
+path, cost = ion.astar_search(
+    start="user:1001",
+    goal="user:1005",
+    heuristic_func=lambda n1, n2: 1.0 if "premium" in n1.tags else 2.0
 )
-
-# 高级模糊搜索
-results = ion.advanced_fuzzy_search("active", {
-    'match_mode': 'contains',
-    'similarity_threshold': 0.5,
-    'combine_results': True
-})
 ```
 
-### 路径查找
+## Advanced Features
+
+### Transaction Management
 
 ```python
-# 查找从一个节点到另一个节点的路径
-path = ion.search_path(node1, node4, max_depth=5)
-
-# 优化版路径搜索
-path = ion.search_path_optimized(node1, node4, max_depth=5, rel_type="references")
-
-# A*搜索
-path, cost = ion.astar_search(node1, node4, 
-    heuristic_func=lambda a, b: 1.0,  # 自定义启发函数
-    weight_func=lambda a, b, r: r.get('weight', 1.0)  # 自定义权重函数
-)
-
-# 高级A*搜索
-path, cost, stats = ion.astar_search_advanced(node1, node4, {
-    'bidirectional': True,  # 使用双向搜索
-    'max_iterations': 5000,  # 最大迭代次数
-    'include_stats': True  # 返回搜索统计信息
-})
-```
-
-### 关系分析
-
-```python
-# 查找与节点相关的所有节点
-related = ion.find_related(node1, max_depth=2)
-
-# 查找两个节点共同关联的节点
-common = ion.find_common_related(node1, node2, rel_type="references")
-
-# 计算节点中心度
-centrality = ion.calculate_centrality()
-
-# 查找关系最多的节点
-most_connected = ion.find_most_connected(top_n=5)
-
-# 获取社区结构
-community = ion.get_community(start_node=node1)
-```
-
-## 事务管理
-
-ION 提供完整的事务支持，可以执行原子操作。
-
-### 基本事务操作
-
-```python
-# 开始事务
-txn = ion.begin_transaction()
-txn_id = txn.id
-
-try:
-    # 在事务中执行操作
-    node1 = ion.create_node_in_transaction(txn_id, "txn_key1", "txn_value1")
-    node2 = ion.create_node_in_transaction(txn_id, "txn_key2", "txn_value2")
-    ion.add_relationship_in_transaction(txn_id, node1, node2, rel_type="created_in_txn")
-    
-    # 提交事务
-    ion.commit_transaction(txn_id)
-except Exception as e:
-    # 出错时中止事务
-    ion.abort_transaction(txn_id)
-    print(f"事务失败: {e}")
-```
-
-### 使用上下文管理器
-
-```python
-# 使用with语句自动处理事务
+# Using a transaction with context manager
 with ion.begin_transaction() as txn:
-    node1 = ion.create_node_in_transaction(txn.id, "txn_key1", "txn_value1")
-    node2 = ion.create_node_in_transaction(txn.id, "txn_key2", "txn_value2")
-    ion.add_relationship_in_transaction(txn.id, node1, node2)
-    # 退出with块时自动提交事务，如有异常则自动中止
+    node1 = ion.create_node_in_transaction(txn.id, "user:1003", "Alice Brown")
+    node2 = ion.create_node_in_transaction(txn.id, "user:1004", "Bob Green")
+    ion.add_relationship_in_transaction(txn.id, node1, node2, "friends")
+    # Transaction automatically commits if no exceptions
+
+# Manual transaction management
+txn = ion.begin_transaction()
+try:
+    # Perform operations
+    ion.create_node_in_transaction(txn.id, "user:1005", "Charlie White")
+    ion.commit_transaction(txn.id)
+except Exception as e:
+    ion.abort_transaction(txn.id, reason=str(e))
 ```
 
-### 批量事务
+### Concurrent Operations
 
 ```python
-# 执行批量操作的事务
-result = ion.batch_transaction([
-    {
-        "type": "create_node",
-        "params": {"key": "batch1", "val": "batch_value1", "tags": ["batch"]}
-    },
-    {
-        "type": "create_node",
-        "params": {"key": "batch2", "val": "batch_value2", "tags": ["batch"]}
-    },
-    {
-        "type": "add_relationship",
-        "params": {"source": "batch1", "target": "batch2", "rel_type": "batch_rel"}
-    }
-])
+# Batch create nodes
+node_data = [
+    {"key": "product:1", "val": "Laptop", "metadata": {"price": 999.99}},
+    {"key": "product:2", "val": "Smartphone", "metadata": {"price": 499.99}},
+    {"key": "product:3", "val": "Tablet", "metadata": {"price": 349.99}}
+]
+nodes = ion.batch_create_nodes(node_data)
 
-if result["success"]:
-    print(f"批量事务成功，{result['operations']} 个操作")
-else:
-    print(f"批量事务失败: {result['error']}")
+# Batch add relationships
+relationships = [
+    {"source": "user:1001", "target": "product:1", "type": "purchased"},
+    {"source": "user:1002", "target": "product:2", "type": "viewed"}
+]
+ion.batch_add_relationships(relationships)
 ```
 
-### 智能更新
+### Compound Indexing
 
 ```python
-# MongoDB风格的更新操作
-result = ion.smart_update(
-    selector={"tags": "important"},  # 选择条件
-    updates={"metadata": {"status": "updated"}},  # 要应用的更新
-    upsert=True,  # 如果没有匹配项则创建新节点
-    multi=True  # 更新所有匹配的节点
+# Create a compound index for faster multi-criteria queries
+ion.create_compound_index(('tag', 'metadata'))
+
+# Query using compound index
+results = ion.compound_search(tag="premium", metadata=("status", "active"))
+```
+
+### Event Callbacks
+
+```python
+# Register event callbacks
+def on_node_added(node):
+    print(f"Node added: {node}")
+
+def on_relation_added(source, target, rel_type):
+    print(f"Relation added: {source.key} --[{rel_type}]--> {target.key}")
+
+ion.register_callback('node_added', on_node_added)
+ion.register_callback('relation_added', on_relation_added)
+```
+
+## Performance Optimization
+
+### Memory Management
+
+```python
+# Configure memory limits
+ion.configure_cache(
+    memory_limit_mb=1024,  # 1GB memory limit
+    cache_strategy="lfu",  # Least Frequently Used cache strategy
+    node_cache_size=5000,
+    query_cache_size=1000
+)
+
+# Run garbage collection manually
+ion._run_garbage_collection(force=True)
+```
+
+### Query Optimization
+
+```python
+# Optimize for path finding
+ion.optimize_for_path_finding(max_cached_paths=2000)
+
+# Use cached path finding
+path, cost = ion.cached_astar_search(
+    start="user:1001",
+    goal="user:1005"
+)
+
+# Get path finding statistics
+stats = ion.get_path_finding_stats()
+print(f"Cache hit ratio: {stats['hit_ratio']:.2f}")
+```
+
+### Large Dataset Handling
+
+```python
+# Create partitions for large datasets
+ion.create_partition("active_users")
+ion.create_partition("inactive_users")
+
+# Assign nodes to partitions
+active_users = ion.find_by_metadata("status", "active")
+for user in active_users:
+    ion.assign_node_to_partition(user, "active_users")
+
+# Query within a specific partition
+results = ion.find_nodes_by_filter(
+    lambda node: "premium" in node.tags,
+    partitions=["active_users"]
+)
+
+# Optimize data distribution
+ion.optimize_data_distribution()
+```
+
+## API Reference
+
+### Constructors
+
+```python
+# Basic constructor
+ION(
+    start=None,              # Optional starting node
+    size=1024,               # Initial bucket size
+    max_workers=4,           # Number of worker threads
+    load_factor_threshold=0.75,  # When to resize
+    enable_memory_optimization=False,
+    large_dataset_mode=False,    # Enable optimizations for large datasets
+    partition_config=None,       # Partition strategy configuration
+    memory_limit_mb=None         # Memory usage limit
 )
 ```
 
-## 并发控制
+### Core Methods
 
-ION 提供两种并发控制模式：乐观并发控制和悲观并发控制。
+#### Node Operations
 
-```python
-# 设置并发控制模式
-ion.set_concurrency_mode("optimistic")  # 或 "pessimistic"
+- `create_node(key, val=None, metadata=None, tags=None, weight=1.0)` - Create a node
+- `get_node_by_key(key)` - Get node by key
+- `get_node_by_value(val)` - Get node by value
+- `remove_node_by_key(key)` - Delete node by key
+- `update_node_metadata(node, new_metadata)` - Update node metadata
+- `update_node_tag(node, operation='add', tags=None, clear_existing=False)` - Update node tags
+- `update_node_weight(node, weight)` - Update node weight
 
-# 设置默认隔离级别
-from ion import IsolationLevel
-ion.set_default_isolation_level(IsolationLevel.REPEATABLE_READ)
-```
+#### Relationship Operations
 
-## 批量操作
+- `add_relationship(source, target, rel_type=None, rel_weight=1.0, metadata=None)` - Add relationship
+- `remove_relationship(source, target, rel_type=None)` - Remove relationship
+- `find_related(node_input, rel_type=None, max_depth=2)` - Find related nodes
+- `find_common_related(node1, node2, rel_type=None, max_depth=2)` - Find common related nodes
 
-ION 提供多种批量操作方法，以提高性能。
+#### Query Operations
 
-```python
-# 批量创建节点
-nodes_data = [
-    {"key": "batch_key1", "val": "batch_val1", "metadata": {"batch": 1}},
-    {"key": "batch_key2", "val": "batch_val2", "tags": ["batch"]},
-    {"key": "batch_key3", "val": "batch_val3", "weight": 2.0}
-]
-results = ion.batch_create_nodes(nodes_data)
+- `find_by_metadata(meta_key, meta_val)` - Find nodes by metadata
+- `find_by_tag(tag)` - Find nodes by tag
+- `find_by_value_type(type_name)` - Find nodes by value type
+- `advanced_search(criteria=None, metadata_filters=None, tag_filters=None, value_type=None, rel_type=None, max_results=None)` - Advanced search
+- `fuzzy_search(query, search_in=None, max_results=50, similarity_threshold=0.6, case_sensitive=False)` - Fuzzy search
+- `compound_search(**conditions)` - Compound index search
 
-# 批量添加关系
-rel_data = [
-    {"source": "batch_key1", "target": "batch_key2", "type": "related_to"},
-    {"source": "batch_key2", "target": "batch_key3", "weight": 1.5}
-]
-results = ion.batch_add_relationships(rel_data)
+#### Transaction Management
 
-# 批量更新节点元数据
-nodes = [node1, node2, node3]
-metadata = {"batch_updated": True, "timestamp": time.time()}
-results = ion.batch_update_node_metadata(nodes, metadata)
+- `begin_transaction(isolation_level=None, timeout=None)` - Begin transaction
+- `commit_transaction(transaction_id)` - Commit transaction
+- `abort_transaction(transaction_id, reason=None)` - Abort transaction
+- `get_transaction(transaction_id)` - Get transaction by ID
+- `get_active_transactions()` - Get all active transactions
 
-# 批量添加标签
-ion.batch_add_tags(nodes, ["batch_processed", "updated"])
+#### Path Finding
 
-# 批量更新权重
-ion.batch_update_node_weights(nodes, 2.0)
-```
+- `search_path(start, end, max_depth=10, rel_type=None)` - Find path between nodes
+- `astar_search(start, goal, heuristic_func=None, weight_func=None, rel_type=None, max_iterations=10000)` - A* path finding
+- `astar_search_advanced(start, goal, options=None)` - Advanced A* path finding
 
-## 性能优化
+## Usage Examples
 
-ION 提供多种性能优化功能。
+### Social Network Analysis
 
 ```python
-# 优化数据库结构
-ion.optimize()
-
-# 优化路径查找性能
-ion.optimize_for_path_finding(max_cached_paths=1000)
-
-# 优化死锁检测
-ion.optimize_deadlock_detection()
-
-# 自动调整线程池大小
-ion.adjust_worker_count(force=True)
-
-# 使用并发迭代器处理大量节点
-for nodes_batch in ion.get_concurrent_iterator(batch_size=100):
-    # 处理这一批节点
-    for node in nodes_batch:
-        print(node.key)
-
-# 并发处理所有节点
-results = ion.process_nodes_concurrently(
-    lambda node: node.key.upper(),  # 处理函数
-    batch_size=50,
-    max_workers=4
-)
-```
-
-## 索引管理
-
-ION 提供多种索引类型和索引管理功能。
-
-```python
-# 创建复合索引
-ion.create_compound_index(("tag", "metadata"))
-ion.create_compound_index(("metadata", "value_type"))
-
-# 使用批量索引更新
-# 注意: 这是内部机制，通常不需要手动调用
-ion._schedule_index_update("add", node, data=None)
-ion._process_index_updates()
-
-# 获取数据库统计信息
-stats = ion.get_stats()
-print(f"节点数: {stats['node_count']}, 桶使用率: {stats['bucket_utilization']}")
-
-# 获取路径查找统计
-path_stats = ion.get_path_finding_stats()
-print(f"缓存命中率: {path_stats['hit_ratio']}")
-
-# 使用自定义哈希函数
-def custom_hash(obj):
-    return hash(str(obj)) % ion.size
-
-# 不建议覆盖默认哈希函数，除非你确切知道你在做什么
-# ion.hf = custom_hash
-```
-
-## 事件系统
-
-ION 提供事件系统，可以注册回调函数在特定事件发生时执行。
-
-```python
-# 注册事件回调
-def on_node_added(node, **kwargs):
-    print(f"节点已添加: {node.key}")
-
-ion.register_callback("node_added", on_node_added)
-
-def on_relation_added(source, target, rel_type, **kwargs):
-    print(f"关系已添加: {source.key} -> {target.key} ({rel_type})")
-
-ion.register_callback("relation_added", on_relation_added)
-
-# 注销回调
-ion.unregister_callback("node_added", on_node_added)
-```
-
-## 持久化
-
-ION 提供保存和加载功能，可以将数据持久化到文件。
-
-```python
-# 保存到文件
-ion.save_to_file("my_database.ion")
-
-# 从文件加载
-loaded_ion = ION.load_from_file("my_database.ion", max_workers=4)
-```
-
-## 高级功能
-
-### 装饰器
-
-```python
-# 性能监控装饰器
-@ION.performance_monitor
-def my_function():
-    # 函数体
-    pass
-
-# 自动事务装饰器
-@ion.auto_transaction
-def my_transactional_function(ion, txn_id, param1, param2):
-    # 操作会自动在事务中执行
-    node = ion.create_node_in_transaction(txn_id, "key", "value")
-    return node
-
-# 安全操作装饰器
-def check_permission(operation, params):
-    # 权限检查逻辑
-    return True
-
-@ion.secure_operation(permission_check=check_permission, audit_log=True)
-def sensitive_operation(ion, param1, param2):
-    # 敏感操作
-    pass
-```
-
-### 字典类操作
-
-ION 实现了类似字典的接口，方便操作。
-
-```python
-# 添加或更新节点
-ion["new_key"] = "new_value"
-ion["existing_key"] = {"val": "complex_value", "metadata": {"updated": True}}
-
-# 检查键是否存在
-if "key" in ion:
-    print("键存在")
-
-# 获取所有键
-for key in ion.keys():
-    print(key)
-
-# 获取所有值
-for value in ion.values():
-    print(value)
-
-# 获取所有键值对
-for key, value in ion.items():
-    print(f"{key}: {value}")
-
-# 获取节点数量
-print(f"共有 {len(ion)} 个节点")
-```
-
-## 使用示例
-
-### 示例1: 创建简单社交网络
-
-```python
-# 创建用户节点
-user1 = ion.create_node("user:1", {
-    "name": "张三",
-    "age": 28
-}, tags=["user", "active"])
-
-user2 = ion.create_node("user:2", {
-    "name": "李四",
-    "age": 32
-}, tags=["user", "active"])
-
-user3 = ion.create_node("user:3", {
-    "name": "王五",
-    "age": 24
-}, tags=["user", "inactive"])
-
-# 添加好友关系
-ion.add_relationship(user1, user2, rel_type="friend", rel_weight=0.8)
-ion.add_relationship(user2, user3, rel_type="friend", rel_weight=0.6)
-
-# 创建内容节点
-post1 = ion.create_node("post:1", {
-    "title": "今天天气真好",
-    "content": "阳光明媚，万里无云"
-}, metadata={"created_by": "user:1"}, tags=["post"])
-
-# 添加发布关系
-ion.add_relationship(user1, post1, rel_type="published")
-
-# 添加点赞关系
-ion.add_relationship(user2, post1, rel_type="liked")
-ion.add_relationship(user3, post1, rel_type="liked")
-
-# 查询示例: 查找谁点赞了特定内容
-likers = []
-for bucket in ion.buckets:
-    for node in bucket:
-        for rel in node.r:
-            if rel['node'] == post1 and rel['type'] == "liked":
-                likers.append(node)
-
-print(f"点赞用户: {[user['name'] for user in likers]}")
-
-# 或使用优化查询
-def find_likers(post):
-    likers = []
-    for bucket in ion.buckets:
-        for node in bucket:
-            for rel in node.r:
-                if rel['node'] == post and rel.get('type') == "liked":
-                    likers.append(node)
-    return likers
-
-likers = find_likers(post1)
-```
-
-### 示例2: 商品推荐系统
-
-```python
-# 创建商品节点
-products = []
-for i in range(1, 11):
-    prod = ion.create_node(f"product:{i}", {
-        "name": f"商品{i}",
-        "price": 100 + i * 10,
-        "category": f"类别{(i-1)//3 + 1}"
-    }, tags=["product"])
-    products.append(prod)
-
-# 创建用户节点
-users = []
-for i in range(1, 6):
-    user = ion.create_node(f"user:{i}", {
-        "name": f"用户{i}"
-    }, tags=["user"])
-    users.append(user)
-
-# 添加购买关系
-import random
-for user in users:
-    # 每个用户购买3-5个商品
-    num_purchases = random.randint(3, 5)
-    for _ in range(num_purchases):
-        product = random.choice(products)
-        ion.add_relationship(user, product, rel_type="purchased", 
-                            metadata={"date": "2023-06-15"})
-
-# 实现基于协同过滤的推荐功能
-def recommend_products(user_node, max_recommendations=3):
-    # 获取用户已购买的商品
-    purchased = set()
-    for rel in user_node.r:
-        if rel.get('type') == "purchased":
-            purchased.add(rel['node'])
-    
-    # 查找购买了相同商品的其他用户
-    similar_users = set()
-    for bucket in ion.buckets:
-        for node in bucket:
-            if node.tags and "user" in node.tags and node != user_node:
-                common_purchases = 0
-                for rel in node.r:
-                    if rel.get('type') == "purchased" and rel['node'] in purchased:
-                        common_purchases += 1
-                if common_purchases > 0:
-                    similar_users.add((node, common_purchases))
-    
-    # 找出相似用户购买但目标用户未购买的商品
-    recommendations = Counter()
-    for user, similarity in similar_users:
-        for rel in user.r:
-            if rel.get('type') == "purchased" and rel['node'] not in purchased:
-                recommendations[rel['node']] += similarity
-    
-    # 返回推荐度最高的商品
-    return [product for product, _ in recommendations.most_common(max_recommendations)]
-
-# 为用户推荐商品
-recommended = recommend_products(users[0])
-print(f"推荐商品: {[p['name'] for p in recommended]}")
-```
-
-### 示例3: 知识图谱
-
-```python
-# 创建概念节点
-concepts = {}
-for name in ["人工智能", "机器学习", "深度学习", "神经网络", "自然语言处理"]:
-    concepts[name] = ion.create_node(f"concept:{name}", {
-        "name": name,
-        "type": "concept"
-    }, tags=["concept"])
-
-# 添加层级关系
-ion.add_relationship(concepts["人工智能"], concepts["机器学习"], rel_type="includes")
-ion.add_relationship(concepts["机器学习"], concepts["深度学习"], rel_type="includes")
-ion.add_relationship(concepts["深度学习"], concepts["神经网络"], rel_type="uses")
-ion.add_relationship(concepts["深度学习"], concepts["自然语言处理"], rel_type="applies_to")
-
-# 创建资源节点
-resources = {}
-resources["书籍1"] = ion.create_node("resource:book1", {
-    "title": "深度学习入门",
-    "author": "张三",
-    "type": "book"
-}, tags=["resource", "book"])
-
-resources["课程1"] = ion.create_node("resource:course1", {
-    "title": "神经网络与深度学习",
-    "instructor": "李四",
-    "type": "course"
-}, tags=["resource", "course"])
-
-# 添加资源关系
-ion.add_relationship(resources["书籍1"], concepts["深度学习"], rel_type="covers")
-ion.add_relationship(resources["书籍1"], concepts["神经网络"], rel_type="covers")
-ion.add_relationship(resources["课程1"], concepts["神经网络"], rel_type="teaches")
-
-# 查询示例: 查找与特定概念相关的所有资源
-def find_resources_for_concept(concept_node, max_depth=2):
-    # 重置访问状态
-    for bucket in ion.buckets:
-        for node in bucket:
-            node.visited = False
-    
-    result = set()
-    
-    def search(node, depth=0):
-        if depth > max_depth:
-            return
-        
-        # 检查是否是资源
-        if node.tags and "resource" in node.tags:
-            result.add(node)
-        
-        node.visited = True
-        
-        # 检查指向当前节点的关系
-        for bucket in ion.buckets:
-            for source_node in bucket:
-                if not source_node.visited:
-                    for rel in source_node.r:
-                        if rel['node'] == node:
-                            search(source_node, depth + 1)
-        
-        # 检查从当前节点出发的关系
-        for rel in node.r:
-            target_node = rel['node']
-            if not target_node.visited:
-                search(target_node, depth + 1)
-    
-    search(concept_node)
-    return result
-
-# 查找与"深度学习"相关的所有资源
-dl_resources = find_resources_for_concept(concepts["深度学习"])
-print(f"深度学习相关资源: {[r['title'] for r in dl_resources]}")
-
-# 或使用内置的路径查找功能
-path = ion.search_path(concepts["人工智能"], resources["课程1"], max_depth=3)
+# Create user nodes
+alice = ion.create_node("user:1", "Alice", metadata={"age": 28})
+bob = ion.create_node("user:2", "Bob", metadata={"age": 32})
+charlie = ion.create_node("user:3", "Charlie", metadata={"age": 24})
+
+# Add friendship relationships
+ion.add_relationship(alice, bob, "friend")
+ion.add_relationship(bob, charlie, "friend")
+
+# Check if there's a path between Alice and Charlie
+path = ion.search_path(alice, charlie)
 if path:
-    print(f"从'人工智能'到'课程1'的路径长度: {len(path)}")
-    path_names = [node['name'] if 'name' in node.metadata else node['title'] for node in path]
-    print(f"路径: {' -> '.join(path_names)}")
+    print(f"Path found: {' -> '.join([node.val for node in path])}")
+    
+# Find users who are friends of Bob
+bobs_friends = ion.find_related(bob, rel_type="friend")
+print(f"Bob's friends: {[friend.val for friend in bobs_friends]}")
+
+# Find users above age 25
+adults = ion.find_nodes_by_filter(
+    lambda node: node.metadata.get("age", 0) > 25
+)
+print(f"Users above 25: {[user.val for user in adults]}")
 ```
 
-## 总结
+### Product Recommendation System
 
-ION 是一个功能强大的数据结构，特别适合处理复杂的对象关系网络。它结合了高效的存储、丰富的查询功能、完善的事务支持和多种性能优化机制，使得开发者能够轻松构建各种复杂的数据处理应用。
+```python
+# Create product nodes
+laptop = ion.create_node(
+    "product:1", 
+    "Laptop",
+    metadata={"category": "electronics", "price": 999.99},
+    tags=["electronics", "computer"]
+)
 
-本指南只涵盖了 ION 的主要功能，更多高级用法请参考源代码和相关文档。 
+smartphone = ion.create_node(
+    "product:2", 
+    "Smartphone",
+    metadata={"category": "electronics", "price": 499.99},
+    tags=["electronics", "mobile"]
+)
+
+headphones = ion.create_node(
+    "product:3", 
+    "Headphones",
+    metadata={"category": "accessories", "price": 99.99},
+    tags=["electronics", "audio"]
+)
+
+# Create customer nodes
+customer1 = ion.create_node("customer:1", "John")
+customer2 = ion.create_node("customer:2", "Sarah")
+
+# Add purchase relationships
+ion.add_relationship(customer1, laptop, "purchased", metadata={"date": "2023-01-15"})
+ion.add_relationship(customer1, headphones, "purchased", metadata={"date": "2023-02-20"})
+ion.add_relationship(customer2, smartphone, "purchased", metadata={"date": "2023-03-10"})
+
+# Find products purchased by a customer
+john_purchases = ion.find_related(customer1, rel_type="purchased")
+print(f"John purchased: {[product.val for product in john_purchases]}")
+
+# Find customers who purchased electronics
+electronics = ion.find_by_tag("electronics")
+customers = set()
+for product in electronics:
+    # Find customers with 'purchased' relationship to this product
+    for bucket in ion.buckets:
+        for node in bucket:
+            for relation in node.r:
+                if relation['node'] == product and relation['type'] == "purchased":
+                    customers.add(node)
+                    
+print(f"Customers who purchased electronics: {[customer.val for customer in customers]}")
+
+# Recommend products based on common purchases
+def get_recommendations(customer, max_recommendations=3):
+    # Get what the customer has already purchased
+    purchased = ion.find_related(customer, rel_type="purchased")
+    purchased_set = set(purchased)
+    
+    # Find similar customers (who purchased at least one same product)
+    similar_customers = set()
+    for product in purchased:
+        # Find customers who purchased this product
+        for bucket in ion.buckets:
+            for node in bucket:
+                if node != customer:  # Exclude the customer himself
+                    for relation in node.r:
+                        if relation['node'] == product and relation['type'] == "purchased":
+                            similar_customers.add(node)
+    
+    # Find products purchased by similar customers but not by this customer
+    recommendations = []
+    for sim_customer in similar_customers:
+        sim_purchases = ion.find_related(sim_customer, rel_type="purchased")
+        for product in sim_purchases:
+            if product not in purchased_set:
+                recommendations.append(product)
+    
+    # Return top recommendations
+    return recommendations[:max_recommendations]
+
+# Get recommendations for John
+recommendations = get_recommendations(customer1)
+print(f"Recommended for John: {[product.val for product in recommendations]}")
+```
+
+## Best Practices
+
+### Memory Optimization
+
+1. **Use appropriate initial size**: Set the initial size based on expected data volume.
+2. **Enable memory optimization**: For large datasets, use `enable_memory_optimization=True`.
+3. **Configure cache limits**: Set appropriate cache sizes based on available memory.
+4. **Use partitioning**: Distribute data across partitions for better memory management.
+5. **Monitor memory usage**: Periodically check memory usage and adjust parameters if needed.
+
+### Performance Tuning
+
+1. **Create compound indexes**: For frequently combined query conditions.
+2. **Use batch operations**: Prefer batch methods for bulk operations.
+3. **Optimize path finding**: Use `optimize_for_path_finding()` for frequent path queries.
+4. **Select appropriate concurrency mode**: Use 'optimistic' mode for read-heavy workloads and 'pessimistic' for write-heavy workloads.
+5. **Configure worker threads**: Set `max_workers` based on available CPU cores and workload characteristics.
+
+### Scaling Guidelines
+
+1. **Enable large dataset mode**: Set `large_dataset_mode=True` for datasets with more than 100,000 nodes.
+2. **Choose effective partitioning strategy**: Based on access patterns.
+3. **Consider sharding**: For extremely large datasets, consider sharding across multiple ION instances.
+4. **Implement periodic optimization**: Call `optimize()` or `optimize_data_distribution()` periodically.
+5. **Monitor performance metrics**: Track operations that take too long and optimize accordingly. 
