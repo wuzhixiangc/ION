@@ -21,7 +21,8 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Set, Tuple, Union, Callable
 from collections import deque, Counter, defaultdict
 import functools
-
+import logging
+import time
 # 导入bsd模块中的ICombinedDataStructure
 from bsd import ICombinedDataStructure, HashTable, NestedBidirectionalMap, RelationshipChain
 
@@ -481,9 +482,10 @@ class ION:
             self._metadata = metadata or {}
             self._weight = float(weight)  # 节点权重
             self._visited = False  # 用于遍历
-            self._created_at = None  # 创建时间
-            self._updated_at = None  # 更新时间
+            self._created_at = time.time()  # 创建时间
+            self._updated_at = time.time()  # 更新时间
             self._ion_reference = None  # 引用所属的ION实例
+            self._partition = None  # 数据分区标识
             
             # 确保标签被正确处理
             if tags is not None:
@@ -495,7 +497,7 @@ class ION:
                     self._tags = set(tags)
             else:
                 self._tags = set()  # 空集合
-            
+        
         @property
         def key(self):
             """键属性访问器"""
@@ -623,8 +625,77 @@ class ION:
         def __str__(self):
             return f"IONNode(key={self._key}, val={self._val}, relations={len(self._r)})"
 
-    def __init__(self, start=None, size=1024, max_workers=4, load_factor_threshold=0.75):
-        """初始化ION实例"""
+    def __init__(self, start=None, size=1024, max_workers=4, load_factor_threshold=0.75, 
+                enable_memory_optimization=False, index_type="hash", cache_strategy="none", 
+                memory_limit_mb=None, persistence_enabled=False, persistence_path=None,
+                auto_optimize=False,
+                # 新增优化选项
+                partition_config=None,
+                parallel_query=False,
+                index_compression=False,
+                large_dataset_mode=False,
+                max_partition_size=10000,
+                dynamic_partition=False,
+                # 性能优化增强选项
+                value_index_type="bidirectional",  # 值索引类型: "bidirectional", "hash", "btree"
+                query_cache_enabled=True,          # 启用查询缓存
+                query_cache_size=1000,             # 查询缓存大小
+                fine_grained_locks=True,           # 细粒度锁
+                lock_timeout_ms=1000,              # 锁超时时间(毫秒)
+                batch_buffer_size=5000,            # 批处理缓冲区大小
+                node_pool_enabled=True,            # 启用节点对象池
+                node_reuse_threshold=0.5,          # 节点重用阈值
+                value_compression=False,           # 值压缩
+                async_indexing=False):             # 异步索引更新
+        """初始化ION实例，添加优化参数支持，特别针对大型数据集(10万+)
+        
+        参数:
+            start: 起始节点
+            size: 初始桶大小，处理大数据时推荐设置更大的值(如100000)
+            max_workers: 并行处理的最大工作线程数
+            load_factor_threshold: 触发扩容的负载因子阈值
+            enable_memory_optimization: 是否启用内存优化
+            index_type: 索引类型，可选值: "hash"(默认), "lsm", "b+tree"
+            cache_strategy: 缓存策略，可选值: "none"(不缓存), "lru", "lfu"
+            memory_limit_mb: 内存限制(MB)，超过此限制触发GC，None表示不限制
+            persistence_enabled: 是否启用自动持久化
+            persistence_path: 持久化路径，None表示使用临时目录
+            auto_optimize: 是否启用自动优化
+            
+            # 大数据集优化选项
+            partition_config: 数据分区配置，格式: {"strategy": "hash|range|field", "field": "metadata_field"}
+            parallel_query: 是否启用并行查询（多线程同时查询不同分区）
+            index_compression: 是否启用索引压缩（以空间换时间，但会降低修改性能）
+            large_dataset_mode: 启用大数据集优化模式（自动调整多个参数）
+            max_partition_size: 每个分区最大节点数，超过将触发分区分裂
+            dynamic_partition: 是否启用动态分区（根据访问模式自动调整分区）
+            
+            # 性能优化增强选项
+            value_index_type: 值索引类型，用于优化按值查询性能
+            query_cache_enabled: 是否启用查询缓存
+            query_cache_size: 查询缓存最大条目数
+            fine_grained_locks: 是否使用细粒度锁替代全局锁
+            lock_timeout_ms: 锁请求超时时间(毫秒)
+            batch_buffer_size: 批处理操作的缓冲区大小
+            node_pool_enabled: 是否启用节点对象池(减少内存分配)
+            node_reuse_threshold: 节点对象重用阈值
+            value_compression: 是否启用值压缩(对大字符串和字典)
+            async_indexing: 是否启用异步索引更新
+        """
+        # 处理大数据集模式
+        if large_dataset_mode:
+            # 自动调整参数以适应大数据集
+            size = max(size, 100000)  # 至少10万桶
+            load_factor_threshold = min(load_factor_threshold, 0.6)  # 降低负载因子
+            enable_memory_optimization = True
+            parallel_query = True
+            query_cache_enabled = True
+            fine_grained_locks = True
+            node_pool_enabled = True
+            if not memory_limit_mb:
+                memory_limit_mb = 2048  # 默认2GB内存限制
+            max_workers = max(max_workers, 8)  # 增加工作线程
+        
         # OND风格的哈希表存储
         self.buckets = [[] for _ in range(size)]
         self.size = size
@@ -641,8 +712,21 @@ class ION:
         self.value_type_index = {}  # 值类型索引
         self.relation_type_index = {}  # 关系类型索引
         
+        # 性能优化增强: 值索引改进
+        self.value_index_type = value_index_type
+        self.value_index = {}  # 优化的值索引
+        
         # 并发和锁
         self.lock = threading.RLock()  # 全局锁
+        
+        # 性能优化增强: 细粒度锁
+        self.fine_grained_locks = fine_grained_locks
+        if fine_grained_locks:
+            # 使用更多更小粒度的锁
+            self.lock_stripes = 64  # 锁分段数
+            self.stripe_locks = [threading.RLock() for _ in range(self.lock_stripes)]
+            self.lock_timeout = lock_timeout_ms / 1000.0  # 转换为秒
+        
         self.bucket_locks = [threading.RLock() for _ in range(size)]  # 桶锁
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
         
@@ -697,6 +781,7 @@ class ION:
         self.value_type_index_lock = threading.RLock()
         self.relation_type_index_lock = threading.RLock()
         self.compound_index_lock = threading.RLock()
+        self.value_index_lock = threading.RLock()  # 新增: 值索引锁
         
         # 添加批量索引更新队列
         self.index_update_queue = []
@@ -705,6 +790,1036 @@ class ION:
         self.index_update_timer = None  # 定时任务
         self.index_update_interval = 5.0  # 定时更新间隔(秒)
         self.is_updating_indices = False  # 是否正在批量更新索引
+        
+        # 优化参数
+        self.enable_memory_optimization = enable_memory_optimization
+        self.index_type = index_type
+        self.cache_strategy = cache_strategy
+        self.memory_limit_mb = memory_limit_mb
+        self.persistence_enabled = persistence_enabled
+        self.persistence_path = persistence_path
+        self.auto_optimize = auto_optimize
+        
+        # 针对大数据集的优化选项
+        self.partition_config = partition_config or {"strategy": "hash", "field": None}
+        self.parallel_query = parallel_query
+        self.index_compression = index_compression
+        self.large_dataset_mode = large_dataset_mode
+        self.max_partition_size = max_partition_size
+        self.dynamic_partition = dynamic_partition
+        
+        # 性能优化增强: 查询缓存
+        self.query_cache_enabled = query_cache_enabled
+        if query_cache_enabled:
+            self.query_cache = {}  # 查询结果缓存
+            self.query_cache_max_size = query_cache_size
+            self.query_cache_hits = 0
+            self.query_cache_misses = 0
+            self.query_cache_lock = threading.RLock()
+        
+        # 性能优化增强: 节点对象池
+        self.node_pool_enabled = node_pool_enabled
+        if node_pool_enabled:
+            self.node_pool = {}  # 键类型 -> [可重用节点列表]
+            self.node_pool_lock = threading.RLock()
+            self.node_reuse_threshold = node_reuse_threshold
+        
+        # 性能优化增强: 值压缩
+        self.value_compression = value_compression
+        
+        # 性能优化增强: 异步索引
+        self.async_indexing = async_indexing
+        if async_indexing:
+            self.indexing_queue = deque(maxlen=10000)
+            self.indexing_thread = threading.Thread(
+                target=self._async_indexing_worker,
+                daemon=True
+            )
+            self.indexing_thread.start()
+        
+        # 性能优化增强: 批处理缓冲
+        self.batch_buffer_size = batch_buffer_size
+        self.batch_buffer = []
+        self.batch_buffer_lock = threading.RLock()
+        
+        # 如果启用大数据集模式，自动调整多个参数
+        if large_dataset_mode:
+            self.enable_memory_optimization = True
+            self.parallel_query = True
+            if self.memory_limit_mb is None:
+                self.memory_limit_mb = 2048  # 默认2GB内存限制
+            if self.cache_strategy == "none":
+                self.cache_strategy = "lfu"  # 大数据集默认使用LFU缓存
+            if size < 100000:
+                # 大数据集模式下，默认使用更大的桶大小
+                self._resize(100000)
+        
+        # 初始化优化相关组件
+        self._init_optimizations()
+        
+        # 数据分区支持
+        self.partitions = {"default": set()}  # 分区名 -> 节点键集合
+        self.node_partition_mapping = {}  # 节点键 -> 分区名
+        self.partition_locks = {"default": threading.RLock()}  # 分区锁
+        self.partition_stats = {"default": {"access_count": 0, "hit_ratio": 0}}  # 分区统计
+        
+        # 分区查询优化
+        if self.parallel_query:
+            # 创建分区专用线程池
+            self.partition_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(len(self.partitions), max_workers)
+            )
+            # 分区查询缓存
+            self.partition_query_cache = {}
+            self.partition_query_cache_lock = threading.RLock()
+        
+        # 内存管理
+        self.memory_monitor_active = enable_memory_optimization  
+        self.memory_monitor_thread = None
+        self.memory_last_gc_time = time.time()
+        self.memory_gc_interval = 300  # 5分钟检查一次内存状态
+        self.memory_usage_stats = []  # 内存使用统计
+        
+        # 缓存系统
+        self._init_cache_system()
+        
+        # 启动内存监控
+        if self.memory_monitor_active:
+            self._start_memory_monitor()
+            
+        # 创建初始分区结构
+        if self.partition_config["strategy"] != "hash" and self.partition_config["field"] is not None:
+            self._initialize_partitions()
+    
+    def _initialize_partitions(self):
+        """根据分区策略初始化分区结构"""
+        strategy = self.partition_config["strategy"]
+        field = self.partition_config["field"]
+        
+        if strategy == "range" and field:
+            # 创建范围分区（例如按时间、ID范围分区）
+            self.create_partition("range_low", f"低范围 {field} 分区")
+            self.create_partition("range_medium", f"中范围 {field} 分区")
+            self.create_partition("range_high", f"高范围 {field} 分区")
+            
+        elif strategy == "field" and field:
+            # 创建字段值分区（例如按状态、类型分区）
+            self.create_partition(f"{field}_none", f"{field} 为空分区")
+            # 其它分区会在数据插入时动态创建
+    
+    def create_dynamic_partition(self, partition_key):
+        """根据分区键动态创建分区
+        
+        参数:
+            partition_key: 分区键
+            
+        返回:
+            str: 分区名称
+        """
+        strategy = self.partition_config["strategy"]
+        field = self.partition_config["field"]
+        
+        if not self.dynamic_partition:
+            return "default"  # 如果不启用动态分区，使用默认分区
+            
+        if strategy == "field" and field:
+            # 创建基于字段值的分区
+            partition_name = f"{field}_{partition_key}"
+            if partition_name not in self.partitions:
+                self.create_partition(partition_name, f"{field}={partition_key} 分区")
+            return partition_name
+            
+        return "default"  # 默认返回默认分区
+    
+    def split_partition(self, partition_name):
+        """当分区大小超过限制时，将分区分裂成多个子分区
+        
+        参数:
+            partition_name: 要分裂的分区名称
+            
+        返回:
+            list: 新创建的分区名称列表
+        """
+        if partition_name not in self.partitions:
+            return []
+            
+        with self.partition_locks[partition_name]:
+            nodes = list(self.partitions[partition_name])
+            if len(nodes) <= self.max_partition_size:
+                return []  # 分区大小未超过限制，无需分裂
+                
+            # 创建子分区
+            sub_partitions = []
+            for i in range(2):  # 分裂为两个子分区
+                sub_name = f"{partition_name}_{i}"
+                if sub_name not in self.partitions:
+                    self.create_partition(sub_name, f"{partition_name} 子分区 {i}")
+                    sub_partitions.append(sub_name)
+            
+            # 重新分配节点
+            mid = len(nodes) // 2
+            for i, node_key in enumerate(nodes):
+                sub_idx = 0 if i < mid else 1
+                sub_name = f"{partition_name}_{sub_idx}"
+                
+                # 获取节点
+                node = self.get_node_by_key(node_key)
+                if node:
+                    self.assign_node_to_partition(node, sub_name)
+            
+            return sub_partitions
+    
+    def merge_partitions(self, partitions_to_merge, new_partition_name=None):
+        """合并多个分区为一个分区
+        
+        参数:
+            partitions_to_merge: 要合并的分区名称列表
+            new_partition_name: 新分区名称，如果为None则使用第一个分区的名称
+            
+        返回:
+            str: 合并后的分区名称
+        """
+        if not partitions_to_merge or len(partitions_to_merge) < 2:
+            return None
+            
+        # 验证所有分区都存在
+        for p in partitions_to_merge:
+            if p not in self.partitions:
+                return None
+                
+        # 确定目标分区名称
+        target_partition = new_partition_name or partitions_to_merge[0]
+        if new_partition_name and new_partition_name not in self.partitions:
+            self.create_partition(new_partition_name, f"合并分区 {new_partition_name}")
+            
+        # 将所有其他分区的节点移动到目标分区
+        for p in partitions_to_merge:
+            if p != target_partition:
+                self.delete_partition(p, move_nodes_to=target_partition)
+                
+        return target_partition
+    
+    def get_partition_for_query(self, query_conditions):
+        """根据查询条件确定需要查询的分区
+        
+        参数:
+            query_conditions: 查询条件字典
+            
+        返回:
+            list: 需要查询的分区名称列表
+        """
+        if not self.partition_config["field"]:
+            return list(self.partitions.keys())  # 返回所有分区
+            
+        field = self.partition_config["field"]
+        strategy = self.partition_config["strategy"]
+        
+        # 如果查询条件中包含分区字段
+        if field in query_conditions:
+            field_value = query_conditions[field]
+            
+            if strategy == "field":
+                # 字段值分区
+                partition_name = f"{field}_{field_value}"
+                if partition_name in self.partitions:
+                    return [partition_name]
+                else:
+                    return [f"{field}_none"]  # 返回空值分区
+                    
+            elif strategy == "range":
+                # 范围分区
+                try:
+                    value = float(field_value)
+                    if value < 100:
+                        return ["range_low"]
+                    elif value < 1000:
+                        return ["range_medium"]
+                    else:
+                        return ["range_high"]
+                except:
+                    return ["default"]
+        
+        # 没有匹配的分区条件，返回所有分区
+        return list(self.partitions.keys())
+    
+    def _init_optimizations(self):
+        """初始化优化组件"""
+        # 索引优化
+        if self.index_type == "lsm":
+            # 实现LSM树索引逻辑
+            self.lsm_memtable = {}  # 内存表
+            self.lsm_sstables = []  # 排序字符串表
+            self.lsm_compaction_threshold = 4  # 合并阈值
+            self.lsm_compaction_lock = threading.RLock()
+            self.lsm_writes_since_compaction = 0
+        elif self.index_type == "b+tree":
+            # 实现B+树索引逻辑
+            self.btree_order = 128  # B+树阶数
+            self.btree_indices = {}  # 字段 -> B+树索引
+        
+        # 批处理优化
+        self.batch_queue = []
+        self.batch_queue_lock = threading.RLock()
+        self.batch_size_threshold = 1000
+        self.batch_flush_interval = 1.0  # 秒
+        self.batch_flush_timer = None
+        
+        # 自动优化
+        if self.auto_optimize:
+            self.optimization_stats = {
+                "query_patterns": Counter(),  # 查询模式统计
+                "access_frequency": Counter(),  # 节点访问频率
+                "operation_latency": [],  # 操作延迟统计
+                "last_optimization": time.time()
+            }
+            # 计划自动优化任务
+            self._schedule_auto_optimization()
+    
+    def _init_cache_system(self):
+        """初始化缓存系统"""
+        # 节点缓存
+        self.node_cache = {}
+        self.node_cache_max_size = 10000
+        
+        # 路径缓存
+        self.path_cache = {}
+        self.path_cache_max_size = 1000
+        
+        # 查询结果缓存
+        self.query_cache = {}
+        self.query_cache_max_size = 500
+        
+        # 缓存统计
+        self.cache_stats = {
+            "hits": 0,
+            "misses": 0,
+            "evictions": 0
+        }
+        
+        # 根据缓存策略初始化辅助数据结构
+        if self.cache_strategy == "lru":
+            # LRU缓存辅助数据
+            self.node_cache_access_time = {}  # 节点键 -> 最后访问时间
+            self.path_cache_access_time = {}  # 缓存键 -> 最后访问时间
+            self.query_cache_access_time = {}  # 查询缓存键 -> 最后访问时间
+        elif self.cache_strategy == "lfu":
+            # LFU缓存辅助数据
+            self.node_cache_frequency = Counter()  # 节点键 -> 访问频率
+            self.path_cache_frequency = Counter()  # 缓存键 -> 访问频率
+            self.query_cache_frequency = Counter()  # 查询缓存键 -> 访问频率
+    
+    def _start_memory_monitor(self):
+        """启动内存监控线程"""
+        def memory_monitor_loop():
+            while self.memory_monitor_active:
+                try:
+                    # 检查内存使用情况
+                    if self.memory_limit_mb:
+                        # 获取当前进程的内存使用
+                        import psutil
+                        process = psutil.Process(os.getpid())
+                        mem_info = process.memory_info()
+                        current_mb = mem_info.rss / (1024 * 1024)
+                        
+                        # 记录内存使用统计
+                        self.memory_usage_stats.append((time.time(), current_mb))
+                        if len(self.memory_usage_stats) > 100:
+                            self.memory_usage_stats = self.memory_usage_stats[-100:]
+                        
+                        # 如果超过限制，触发垃圾回收
+                        if current_mb > self.memory_limit_mb:
+                            self._run_garbage_collection()
+                    
+                    # 定期垃圾回收
+                    now = time.time()
+                    if now - self.memory_last_gc_time > self.memory_gc_interval:
+                        self._run_garbage_collection(force=True)
+                        self.memory_last_gc_time = now
+                        
+                except Exception as e:
+                    logging.error(f"内存监控错误: {e}")
+                
+                # 休眠
+                time.sleep(30)  # 30秒检查一次
+        
+        # 创建并启动内存监控线程
+        self.memory_monitor_thread = threading.Thread(
+            target=memory_monitor_loop, 
+            daemon=True,  # 设为守护线程，程序退出时自动结束
+            name="ION-MemoryMonitor"
+        )
+        self.memory_monitor_thread.start()
+    
+    def _run_garbage_collection(self, force=False):
+        """运行垃圾回收，清理未使用的资源"""
+        if not self.enable_memory_optimization and not force:
+            return
+            
+        # 记录开始时间
+        start_time = time.time()
+        logging.info("开始执行垃圾回收...")
+        
+        try:
+            # 1. 清理节点对象池
+            with self.node_pool_lock:
+                self.node_pool.clear()
+            
+            # 2. 清理未使用的索引
+            self._cleanup_unused_indices()
+            
+            # 3. 清理缓存
+            self._cleanup_caches()
+            
+            # 4. 调用Python垃圾回收器
+            import gc
+            gc.collect()
+            
+            # 记录结束时间和释放的内存
+            end_time = time.time()
+            logging.info(f"垃圾回收完成，耗时: {end_time - start_time:.2f}秒")
+            
+            # 触发事件
+            self._trigger_event('gc_completed', duration=end_time - start_time)
+            
+        except Exception as e:
+            logging.error(f"垃圾回收失败: {e}")
+    
+    def _cleanup_unused_indices(self):
+        """清理未使用的索引"""
+        # 清理空的元数据索引
+        with self.metadata_index_lock:
+            empty_keys = [k for k, v in self.metadata_index.items() if not v]
+            for k in empty_keys:
+                del self.metadata_index[k]
+        
+        # 清理空的标签索引
+        with self.tag_index_lock:
+            empty_tags = [t for t, nodes in self.tag_index.items() if not nodes]
+            for t in empty_tags:
+                del self.tag_index[t]
+        
+        # 清理空的值类型索引
+        with self.value_type_index_lock:
+            empty_types = [t for t, nodes in self.value_type_index.items() if not nodes]
+            for t in empty_types:
+                del self.value_type_index[t]
+        
+        # 清理空的复合索引
+        with self.compound_index_lock:
+            for index_types in list(self.compound_indices.keys()):
+                empty_keys = [k for k, nodes in self.compound_indices[index_types].items() if not nodes]
+                for k in empty_keys:
+                    del self.compound_indices[index_types][k]
+    
+    def _cleanup_caches(self):
+        """清理缓存"""
+        if self.cache_strategy == "lru":
+            self._cleanup_lru_caches()
+        elif self.cache_strategy == "lfu":
+            self._cleanup_lfu_caches()
+        else:
+            # 默认清理策略 - 当缓存超出最大大小时清理
+            self._cleanup_default_caches()
+    
+    def _cleanup_lru_caches(self):
+        """基于LRU策略清理缓存"""
+        # 清理节点缓存
+        if len(self.node_cache) > self.node_cache_max_size:
+            # 按访问时间排序
+            sorted_items = sorted(self.node_cache_access_time.items(), key=lambda x: x[1])
+            # 删除最旧的20%
+            num_to_remove = max(1, int(self.node_cache_max_size * 0.2))
+            for key, _ in sorted_items[:num_to_remove]:
+                if key in self.node_cache:
+                    del self.node_cache[key]
+                    del self.node_cache_access_time[key]
+                    self.cache_stats["evictions"] += 1
+        
+        # 清理路径缓存
+        if len(self.path_cache) > self.path_cache_max_size:
+            sorted_items = sorted(self.path_cache_access_time.items(), key=lambda x: x[1])
+            num_to_remove = max(1, int(self.path_cache_max_size * 0.2))
+            for key, _ in sorted_items[:num_to_remove]:
+                if key in self.path_cache:
+                    del self.path_cache[key]
+                    del self.path_cache_access_time[key]
+                    self.cache_stats["evictions"] += 1
+        
+        # 清理查询缓存
+        if len(self.query_cache) > self.query_cache_max_size:
+            sorted_items = sorted(self.query_cache_access_time.items(), key=lambda x: x[1])
+            num_to_remove = max(1, int(self.query_cache_max_size * 0.2))
+            for key, _ in sorted_items[:num_to_remove]:
+                if key in self.query_cache:
+                    del self.query_cache[key]
+                    del self.query_cache_access_time[key]
+                    self.cache_stats["evictions"] += 1
+    
+    def _cleanup_lfu_caches(self):
+        """基于LFU策略清理缓存"""
+        # 清理节点缓存
+        if len(self.node_cache) > self.node_cache_max_size:
+            # 按访问频率排序
+            sorted_items = sorted(self.node_cache_frequency.items(), key=lambda x: x[1])
+            # 删除使用最少的20%
+            num_to_remove = max(1, int(self.node_cache_max_size * 0.2))
+            for key, _ in sorted_items[:num_to_remove]:
+                if key in self.node_cache:
+                    del self.node_cache[key]
+                    del self.node_cache_frequency[key]
+                    self.cache_stats["evictions"] += 1
+        
+        # 清理路径缓存
+        if len(self.path_cache) > self.path_cache_max_size:
+            sorted_items = sorted(self.path_cache_frequency.items(), key=lambda x: x[1])
+            num_to_remove = max(1, int(self.path_cache_max_size * 0.2))
+            for key, _ in sorted_items[:num_to_remove]:
+                if key in self.path_cache:
+                    del self.path_cache[key]
+                    del self.path_cache_frequency[key]
+                    self.cache_stats["evictions"] += 1
+        
+        # 清理查询缓存
+        if len(self.query_cache) > self.query_cache_max_size:
+            sorted_items = sorted(self.query_cache_frequency.items(), key=lambda x: x[1])
+            num_to_remove = max(1, int(self.query_cache_max_size * 0.2))
+            for key, _ in sorted_items[:num_to_remove]:
+                if key in self.query_cache:
+                    del self.query_cache[key]
+                    del self.query_cache_frequency[key]
+                    self.cache_stats["evictions"] += 1
+    
+    def _cleanup_default_caches(self):
+        """基本缓存清理"""
+        # 清理节点缓存
+        if len(self.node_cache) > self.node_cache_max_size:
+            # 随机删除一些键
+            num_to_remove = max(1, int(self.node_cache_max_size * 0.2))
+            keys_to_remove = list(self.node_cache.keys())[:num_to_remove]
+            for key in keys_to_remove:
+                del self.node_cache[key]
+                self.cache_stats["evictions"] += 1
+        
+        # 清理路径缓存
+        if len(self.path_cache) > self.path_cache_max_size:
+            num_to_remove = max(1, int(self.path_cache_max_size * 0.2))
+            keys_to_remove = list(self.path_cache.keys())[:num_to_remove]
+            for key in keys_to_remove:
+                del self.path_cache[key]
+                self.cache_stats["evictions"] += 1
+        
+        # 清理查询缓存
+        if len(self.query_cache) > self.query_cache_max_size:
+            num_to_remove = max(1, int(self.query_cache_max_size * 0.2))
+            keys_to_remove = list(self.query_cache.keys())[:num_to_remove]
+            for key in keys_to_remove:
+                del self.query_cache[key]
+                self.cache_stats["evictions"] += 1
+    
+    def _schedule_auto_optimization(self):
+        """调度自动优化任务"""
+        if not self.auto_optimize:
+            return
+            
+        def auto_optimize_task():
+            while self.auto_optimize:
+                try:
+                    # 每6小时运行一次自动优化
+                    time.sleep(6 * 60 * 60)
+                    if not self.auto_optimize:
+                        break
+                        
+                    # 运行优化任务
+                    self._run_auto_optimization()
+                    
+                except Exception as e:
+                    logging.error(f"自动优化任务失败: {e}")
+        
+        # 创建并启动自动优化线程
+        threading.Thread(
+            target=auto_optimize_task, 
+            daemon=True,
+            name="ION-AutoOptimizer"
+        ).start()
+    
+    def _run_auto_optimization(self):
+        """运行自动优化操作"""
+        # 记录开始时间
+        start_time = time.time()
+        logging.info("开始执行自动优化...")
+        
+        try:
+            # 1. 分析查询模式
+            self._analyze_query_patterns()
+            
+            # 2. 优化索引
+            self._optimize_indices()
+            
+            # 3. 重新平衡数据分区
+            self._rebalance_partitions()
+            
+            # 4. 调整缓存大小
+            self._adjust_cache_sizes()
+            
+            # 记录最后优化时间
+            self.optimization_stats["last_optimization"] = time.time()
+            
+            # 记录结束时间
+            end_time = time.time()
+            logging.info(f"自动优化完成，耗时: {end_time - start_time:.2f}秒")
+            
+            # 触发事件
+            self._trigger_event('optimization_completed', duration=end_time - start_time)
+            
+        except Exception as e:
+            logging.error(f"自动优化失败: {e}")
+    
+    def create_partition(self, partition_name, description=None):
+        """创建新的数据分区
+        
+        参数:
+            partition_name: 分区名称
+            description: 分区描述
+            
+        返回:
+            bool: 是否创建成功
+        """
+        if partition_name in self.partitions:
+            return False  # 分区已存在
+            
+        with self.lock:
+            self.partitions[partition_name] = set()
+            self.partition_locks[partition_name] = threading.RLock()
+            self.partition_stats[partition_name] = {
+                "access_count": 0,
+                "hit_ratio": 0,
+                "created_time": time.time(),
+                "description": description or f"分区 {partition_name}",
+                "last_accessed": time.time(),
+                "node_count": 0
+            }
+            
+            # 如果启用并行查询，更新分区查询线程池
+            if self.parallel_query and hasattr(self, 'partition_executor'):
+                # 关闭当前线程池
+                self.partition_executor.shutdown(wait=False)
+                # 创建新的线程池，适应当前分区数量
+                self.partition_executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=min(len(self.partitions), self.max_workers)
+                )
+                
+            return True
+    
+    def delete_partition(self, partition_name, move_nodes_to=None):
+        """删除数据分区
+        
+        参数:
+            partition_name: 分区名称
+            move_nodes_to: 将节点移动到指定分区，如果为None则删除节点
+            
+        返回:
+            bool: 是否删除成功
+        """
+        if partition_name not in self.partitions or partition_name == "default":
+            return False  # 分区不存在或尝试删除默认分区
+            
+        with self.lock:
+            # 获取分区中的所有节点
+            nodes_to_move = list(self.partitions[partition_name])
+            
+            if move_nodes_to and move_nodes_to in self.partitions:
+                # 将节点移动到目标分区
+                for node_key in nodes_to_move:
+                    node = self.get_node_by_key(node_key)
+                    if node:
+                        self.assign_node_to_partition(node, move_nodes_to)
+            else:
+                # 从分区映射中删除节点
+                for node_key in nodes_to_move:
+                    if node_key in self.node_partition_mapping:
+                        del self.node_partition_mapping[node_key]
+            
+            # 删除分区相关数据
+            del self.partitions[partition_name]
+            del self.partition_locks[partition_name]
+            del self.partition_stats[partition_name]
+            
+            return True
+    
+    def assign_node_to_partition(self, node, partition_name):
+        """将节点分配到指定分区
+        
+        参数:
+            node: 节点对象
+            partition_name: 分区名称
+            
+        返回:
+            bool: 是否分配成功
+        """
+        if partition_name not in self.partitions:
+            # 如果分区不存在且启用动态分区，则创建新分区
+            if self.dynamic_partition:
+                self.create_partition(partition_name)
+            else:
+                return False
+        
+        node_key = node.key
+        
+        # 从当前分区移除节点
+        current_partition = self.node_partition_mapping.get(node_key, "default")
+        if current_partition in self.partitions:
+            with self.partition_locks[current_partition]:
+                if node_key in self.partitions[current_partition]:
+                    self.partitions[current_partition].remove(node_key)
+                    # 更新分区统计
+                    self.partition_stats[current_partition]["node_count"] = \
+                        len(self.partitions[current_partition])
+        
+        # 将节点添加到新分区
+        with self.partition_locks[partition_name]:
+            self.partitions[partition_name].add(node_key)
+            self.node_partition_mapping[node_key] = partition_name
+            
+            # 更新分区统计
+            self.partition_stats[partition_name]["node_count"] = \
+                len(self.partitions[partition_name])
+            self.partition_stats[partition_name]["last_accessed"] = time.time()
+            
+            # 检查分区大小，如果超过阈值则分裂
+            if self.dynamic_partition and len(self.partitions[partition_name]) > self.max_partition_size:
+                self.split_partition(partition_name)
+        
+        return True
+    
+    def get_partition_stats(self, partition_name=None):
+        """获取分区统计信息
+        
+        参数:
+            partition_name: 分区名称，如果为None则返回所有分区的统计
+            
+        返回:
+            dict: 分区统计信息
+        """
+        if partition_name:
+            if partition_name in self.partition_stats:
+                stats = self.partition_stats[partition_name].copy()
+                # 添加一些实时计算的统计
+                if partition_name in self.partitions:
+                    stats["current_size"] = len(self.partitions[partition_name])
+                return stats
+            return None
+        
+        # 返回所有分区的统计
+        result = {}
+        for name, stats in self.partition_stats.items():
+            result[name] = stats.copy()
+            if name in self.partitions:
+                result[name]["current_size"] = len(self.partitions[name])
+        
+        # 添加总体统计
+        result["_summary"] = {
+            "total_partitions": len(self.partitions),
+            "total_nodes": sum(len(p) for p in self.partitions.values()),
+            "avg_partition_size": sum(len(p) for p in self.partitions.values()) / max(1, len(self.partitions))
+        }
+        
+        return result
+        
+    def get_node_partition(self, node_key):
+        """获取节点所在的分区
+        
+        参数:
+            node_key: 节点键
+            
+        返回:
+            str: 分区名称
+        """
+        return self.node_partition_mapping.get(node_key, "default")
+    
+    def get_partition_for_query(self, query_conditions):
+        """根据查询条件确定需要查询的分区
+        
+        参数:
+            query_conditions: 查询条件字典
+            
+        返回:
+            list: 需要查询的分区名称列表
+        """
+        if not self.partition_config["field"]:
+            return list(self.partitions.keys())  # 返回所有分区
+            
+        field = self.partition_config["field"]
+        strategy = self.partition_config["strategy"]
+        
+        # 如果查询条件中包含分区字段
+        if field in query_conditions:
+            field_value = query_conditions[field]
+            
+            if strategy == "field":
+                # 字段值分区
+                partition_name = f"{field}_{field_value}"
+                if partition_name in self.partitions:
+                    return [partition_name]
+                else:
+                    return [f"{field}_none"]  # 返回空值分区
+                    
+            elif strategy == "range":
+                # 范围分区
+                try:
+                    value = float(field_value)
+                    if value < 100:
+                        return ["range_low"]
+                    elif value < 1000:
+                        return ["range_medium"]
+                    else:
+                        return ["range_high"]
+                except:
+                    return ["default"]
+        
+        # 没有匹配的分区条件，返回所有分区
+        return list(self.partitions.keys())
+    
+    def _rebalance_partitions(self):
+        """重新平衡分区"""
+        if len(self.partitions) <= 1:
+            return  # 只有一个分区，无需平衡
+            
+        partition_sizes = {name: len(nodes) for name, nodes in self.partitions.items()}
+        
+        # 计算平均大小
+        total_nodes = sum(partition_sizes.values())
+        avg_size = total_nodes / len(self.partitions)
+        
+        # 找出过大和过小的分区
+        oversized = []
+        undersized = []
+        
+        for name, size in partition_sizes.items():
+            if size > avg_size * 1.2:  # 超过平均大小20%
+                oversized.append((name, size))
+            elif size < avg_size * 0.8:  # 低于平均大小20%
+                undersized.append((name, size))
+                
+        # 按大小倒序排序
+        oversized.sort(key=lambda x: x[1], reverse=True)
+        undersized.sort(key=lambda x: x[1])
+        
+        # 移动节点来平衡分区
+        for over_name, over_size in oversized:
+            # 当前分区是否仍然过大
+            current_size = len(self.partitions[over_name])
+            if current_size <= avg_size * 1.1:  # 允许10%的误差
+                continue
+                
+            # 需要移动的节点数
+            to_move = int(current_size - avg_size)
+            
+            for under_name, _ in undersized:
+                # 目标分区是否仍然过小
+                under_current_size = len(self.partitions[under_name])
+                if under_current_size >= avg_size * 0.9:  # 允许10%的误差
+                    continue
+                    
+                # 确定移动数量
+                move_count = min(to_move, int(avg_size - under_current_size))
+                if move_count <= 0:
+                    continue
+                    
+                # 从过大分区中选择节点移动
+                nodes_to_move = list(self.partitions[over_name])[:move_count]
+                
+                # 移动节点
+                for node_key in nodes_to_move:
+                    with self.partition_locks[over_name]:
+                        self.partitions[over_name].remove(node_key)
+                        
+                    with self.partition_locks[under_name]:
+                        self.partitions[under_name].add(node_key)
+                        self.node_partition_mapping[node_key] = under_name
+                        
+                        # 更新节点分区信息
+                        node_obj = self.get_node_by_key(node_key)
+                        if node_obj:
+                            node_obj._partition = under_name
+                
+                # 更新移动计数
+                to_move -= move_count
+                if to_move <= 0:
+                    break
+    
+    def _analyze_query_patterns(self):
+        """分析查询模式，更新优化统计信息"""
+        # 分析查询频率最高的字段，考虑创建索引
+        query_patterns = self.optimization_stats["query_patterns"]
+        if query_patterns:
+            top_fields = query_patterns.most_common(5)
+            
+            # 对高频查询字段创建索引
+            for field, count in top_fields:
+                if count > 20 and ":" in field:  # 最低阈值，格式如 "metadata:status"
+                    parts = field.split(":", 1)
+                    if len(parts) == 2:
+                        index_type, field_name = parts
+                        if index_type == "metadata" and field_name not in self.btree_indices:
+                            # 为高频元数据字段创建B+树索引
+                            if self.index_type == "b+tree":
+                                self._create_btree_index_for_field(field_name)
+                
+        # 根据访问频率调整缓存分配
+        access_freq = self.optimization_stats["access_frequency"]
+        if access_freq:
+            # 根据访问频率调整各缓存大小比例
+            total_accesses = sum(access_freq.values())
+            if total_accesses > 0:
+                path_ratio = sum(v for k, v in access_freq.items() if k.startswith("path:")) / total_accesses
+                query_ratio = sum(v for k, v in access_freq.items() if k.startswith("query:")) / total_accesses
+                node_ratio = 1 - path_ratio - query_ratio
+                
+                # 根据比例调整最大缓存大小
+                total_cache = self.node_cache_max_size + self.path_cache_max_size + self.query_cache_max_size
+                
+                # 计算新的缓存大小（最小保持原来的20%）
+                new_node_cache_size = max(int(total_cache * node_ratio), int(self.node_cache_max_size * 0.2))
+                new_path_cache_size = max(int(total_cache * path_ratio), int(self.path_cache_max_size * 0.2))
+                new_query_cache_size = max(int(total_cache * query_ratio), int(self.query_cache_max_size * 0.2))
+                
+                # 确保总和不变
+                total_new = new_node_cache_size + new_path_cache_size + new_query_cache_size
+                if total_new != total_cache:
+                    # 按比例调整
+                    factor = total_cache / total_new
+                    new_node_cache_size = int(new_node_cache_size * factor)
+                    new_path_cache_size = int(new_path_cache_size * factor)
+                    new_query_cache_size = total_cache - new_node_cache_size - new_path_cache_size
+                
+                # 更新缓存大小
+                self.node_cache_max_size = new_node_cache_size
+                self.path_cache_max_size = new_path_cache_size
+                self.query_cache_max_size = new_query_cache_size
+    
+    def _create_btree_index_for_field(self, field_name):
+        """为特定字段创建B+树索引"""
+        if self.index_type != "b+tree" or field_name in self.btree_indices:
+            return
+            
+        # 创建B+树索引
+        try:
+            # 初始化B+树索引
+            self.btree_indices[field_name] = {}
+            
+            # 填充索引
+            for bucket in self.buckets:
+                for node in bucket:
+                    if node.metadata and field_name in node.metadata:
+                        value = node.metadata[field_name]
+                        if value not in self.btree_indices[field_name]:
+                            self.btree_indices[field_name][value] = []
+                        self.btree_indices[field_name][value].append(node)
+                        
+            logging.info(f"为字段 '{field_name}' 创建了B+树索引")
+        except Exception as e:
+            logging.error(f"创建B+树索引失败: {e}")
+            if field_name in self.btree_indices:
+                del self.btree_indices[field_name]
+    
+    def _adjust_cache_sizes(self):
+        """根据内存限制和使用情况调整缓存大小"""
+        if not self.memory_limit_mb or not self.enable_memory_optimization:
+            return
+            
+        try:
+            # 获取当前内存使用情况
+            import psutil
+            process = psutil.Process(os.getpid())
+            mem_info = process.memory_info()
+            current_mb = mem_info.rss / (1024 * 1024)
+            
+            # 计算缓存使用的估计内存
+            cache_size = len(self.node_cache) + len(self.path_cache) + len(self.query_cache)
+            
+            # 如果超过内存限制的70%，减少缓存大小
+            if current_mb > self.memory_limit_mb * 0.7:
+                reduction_factor = 0.8  # 减少20%
+                self.node_cache_max_size = int(self.node_cache_max_size * reduction_factor)
+                self.path_cache_max_size = int(self.path_cache_max_size * reduction_factor)
+                self.query_cache_max_size = int(self.query_cache_max_size * reduction_factor)
+                
+                # 清理部分缓存
+                self._cleanup_caches()
+                
+                logging.info(f"由于内存压力，缓存大小减少至: 节点({self.node_cache_max_size}), 路径({self.path_cache_max_size}), 查询({self.query_cache_max_size})")
+            
+            # 如果内存使用低于限制的40%，可以增加缓存大小
+            elif current_mb < self.memory_limit_mb * 0.4:
+                growth_factor = 1.2  # 增加20%
+                self.node_cache_max_size = int(self.node_cache_max_size * growth_factor)
+                self.path_cache_max_size = int(self.path_cache_max_size * growth_factor)
+                self.query_cache_max_size = int(self.query_cache_max_size * growth_factor)
+                
+                logging.info(f"由于内存充足，缓存大小增加至: 节点({self.node_cache_max_size}), 路径({self.path_cache_max_size}), 查询({self.query_cache_max_size})")
+                
+        except ImportError:
+            logging.warning("无法导入psutil模块，跳过缓存大小调整")
+        except Exception as e:
+            logging.error(f"调整缓存大小失败: {e}")
+            
+    def configure_cache(self, memory_limit_mb=None, cache_strategy=None, 
+                       node_cache_size=None, path_cache_size=None, query_cache_size=None,
+                       persistence_interval=None):
+        """配置缓存系统
+        
+        参数:
+            memory_limit_mb: 内存限制(MB)
+            cache_strategy: 缓存策略 ('none', 'lru', 'lfu')
+            node_cache_size: 节点缓存大小
+            path_cache_size: 路径缓存大小
+            query_cache_size: 查询缓存大小
+            persistence_interval: 持久化间隔(秒)
+            
+        返回:
+            self
+        """
+        changes_made = False
+        
+        # 更新内存限制
+        if memory_limit_mb is not None:
+            self.memory_limit_mb = memory_limit_mb
+            changes_made = True
+            
+        # 更新缓存策略
+        if cache_strategy in ('none', 'lru', 'lfu'):
+            old_strategy = self.cache_strategy
+            self.cache_strategy = cache_strategy
+            
+            # 如果策略改变，重新初始化缓存系统
+            if old_strategy != cache_strategy:
+                self._init_cache_system()
+                changes_made = True
+                
+        # 更新缓存大小
+        if node_cache_size is not None:
+            self.node_cache_max_size = node_cache_size
+            changes_made = True
+            
+        if path_cache_size is not None:
+            self.path_cache_max_size = path_cache_size
+            changes_made = True
+            
+        if query_cache_size is not None:
+            self.query_cache_max_size = query_cache_size
+            changes_made = True
+            
+        # 更新持久化间隔
+        if persistence_interval is not None and persistence_interval > 0:
+            self.persistence_enabled = True
+            self.persistence_interval = persistence_interval
+            changes_made = True
+            
+        # 如果发生变化且启用了内存优化，清理缓存
+        if changes_made and self.enable_memory_optimization:
+            self._cleanup_caches()
+            
+        return self
     
     def hf(self, obj):
         """哈希函数，通用对象到数字的映射"""
@@ -766,69 +1881,202 @@ class ION:
         """获取当前负载因子"""
         return self.count / self.size if self.size > 0 else 1.0
     
-    def create_node(self, key, val, metadata=None, tags=None, weight=1.0):
-        """创建新节点或更新现有节点"""
-        # 检查是否需要扩容
-        self._check_resize()
+    def create_node(self, key, val=None, metadata=None, tags=None, weight=1.0):
+        """创建新节点或更新现有节点，支持自动分区
         
-        # 处理标签参数 - 确保字符串类型的标签被视为单个标签而不是字符序列
-        if tags is not None and isinstance(tags, str):
-            tags = [tags]  # 将字符串转换为单元素列表
-        
-        index = self.hf(key)
-        with self.bucket_locks[index]:
-            nodes = self.buckets[index]
-            for node in nodes:
-                if node.key == key:
-                    # 节点已存在，更新
-                    old_val = node.val
-                    node.val = val
-                    
-                    if metadata:
-                        self.update_node_metadata(node, metadata)
-                    
-                    if tags:
-                        for tag in tags:
-                            node.add_tag(tag)
-                            
-                    if weight != 1.0:
-                        node.weight = weight
-                        
-                    self._trigger_event('node_updated', node=node, old_val=old_val)
-                    return node
+        Args:
+            key: 节点键
+            val: 节点值
+            metadata: 节点元数据字典
+            tags: 节点标签列表
+            weight: 节点权重
             
-            # 创建新节点
+        Returns:
+            Node: 创建或更新的节点
+        """
+        metadata = metadata or {}
+        tags = tags or []
+        
+        # 1. 检查节点是否已存在
+        existing_node = self.get_node_by_key(key)
+        
+        # 2. 如果节点已存在，更新它
+        if existing_node:
+            # 仅在需要时创建事务来包装更新
+            with self.begin_transaction(isolation_level=IsolationLevel.READ_COMMITTED):
+                # 更新节点值
+                if val is not None and existing_node.val != val:
+                    existing_node.val = val
+                
+                # 更新节点元数据
+                if metadata:
+                    self.update_node_metadata(existing_node, metadata)
+                
+                # 更新节点标签
+                if tags:
+                    existing_node_tags = existing_node.tags or []
+                    for tag in tags:
+                        if tag not in existing_node_tags:
+                            self.update_node_tag(existing_node, tag, add=True)
+                
+                # 更新节点权重
+                if existing_node.weight != weight:
+                    self.update_node_weight(existing_node, weight)
+                
+            return existing_node
+        
+        # 3. 创建新节点
+        with self.lock:
+            # 创建新的IONNode实例
             new_node = self.node_class(key, val, metadata, tags, weight)
-            new_node._ion_reference = self  # 设置ION引用
-            nodes.append(new_node)
-            self.count += 1
             
-            # 更新各种索引
-            self.bimap.add(key, val)
+            # 计算键的哈希值并确定存储桶
+            bucket_index = self.hf(key)  # 使用类的哈希函数计算索引
             
-            # 添加到组合数据结构
-            self._combined_data.put(key, val, metadata=metadata)
-            
-            # 索引元数据
-            if metadata:
-                for m_key, m_val in metadata.items():
-                    self._index_metadata(m_key, m_val, new_node)
-            
-            # 索引标签
-            if tags:
-                for tag in tags:
-                    self._index_tag(tag, new_node)
-            
-            # 索引值类型
-            self._index_value_type(val, new_node)
-            
-            self._trigger_event('node_added', node=new_node)
-            
-            # 添加到所有复合索引
-            for index_types in self.compound_index_types:
-                self._index_node_to_compound(new_node, index_types)
+            # 获取桶锁并添加节点
+            with self.bucket_locks[bucket_index]:
+                self.buckets[bucket_index].append(new_node)
+                
+                # 更新计数
+                self.count += 1
+                
+                # 选择合适的分区
+                if self.partition_config["field"] is not None and self.partition_config["field"] in metadata:
+                    # 基于分区字段值选择或创建分区
+                    field_value = metadata[self.partition_config["field"]]
+                    
+                    if self.partition_config["strategy"] == "field":
+                        # 字段值分区
+                        partition_name = self.create_dynamic_partition(field_value)
+                    elif self.partition_config["strategy"] == "range":
+                        # 范围分区 
+                        try:
+                            value = float(field_value)
+                            if value < 100:
+                                partition_name = "range_low"
+                            elif value < 1000:
+                                partition_name = "range_medium"
+                            else:
+                                partition_name = "range_high"
+                        except:
+                            partition_name = "default"
+                    else:
+                        # 哈希分区
+                        partition_name = "default"
+                else:
+                    # 默认分区
+                    partition_name = "default"
+                
+                # 将节点添加到选定的分区
+                self.assign_node_to_partition(new_node, partition_name)
+                        
+                # 添加到各种索引和双向映射
+                # self._schedule_index_update('add', new_node)
+                
+                # 直接更新索引
+                self.bimap.add(new_node.key, new_node.val)
+                
+                # 添加到组合数据结构
+                self._combined_data.put(new_node.key, new_node.val, metadata=new_node.metadata)
+                
+                # 索引元数据
+                if new_node.metadata:
+                    for m_key, m_val in new_node.metadata.items():
+                        self._index_metadata(m_key, m_val, new_node)
+                
+                # 索引标签
+                if new_node.tags:
+                    for tag in new_node.tags:
+                        self._index_tag(tag, new_node)
+                        
+                # 索引值类型
+                self._index_value_type(new_node.val, new_node)
+                
+                # 触发事件回调
+                self._trigger_event('node_added', node=new_node)
+                
+                # 检查是否需要扩容
+                if self.count > self.size * self.load_factor_threshold:
+                    # self._schedule_resize()
+                    self._check_resize()
             
             return new_node
+            
+    def _get_nodes_from_partitions(self, partitions, filter_func=None):
+        """从指定分区获取所有节点
+        
+        参数:
+            partitions: 分区名称列表 
+            filter_func: 可选的过滤函数
+            
+        返回:
+            list: 节点列表
+        """
+        results = []
+        
+        # 如果启用并行查询且有多个分区，使用并行执行
+        if self.parallel_query and len(partitions) > 1 and hasattr(self, 'partition_executor'):
+            futures = []
+            for partition_name in partitions:
+                if partition_name in self.partitions:
+                    futures.append(self.partition_executor.submit(
+                        self._get_nodes_from_single_partition, 
+                        partition_name, 
+                        filter_func
+                    ))
+            
+            # 收集结果
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    nodes = future.result()
+                    results.extend(nodes)
+                except Exception as e:
+                    print(f"Error getting nodes from partition: {e}")
+        else:
+            # 串行处理
+            for partition_name in partitions:
+                if partition_name in self.partitions:
+                    nodes = self._get_nodes_from_single_partition(partition_name, filter_func)
+                    results.extend(nodes)
+        
+        return results
+    
+    def _get_nodes_from_single_partition(self, partition_name, filter_func=None):
+        """从单个分区获取节点
+        
+        参数:
+            partition_name: 分区名称
+            filter_func: 可选的过滤函数
+            
+        返回:
+            list: 节点列表
+        """
+        results = []
+        
+        # 更新分区访问统计
+        if partition_name in self.partition_stats:
+            self.partition_stats[partition_name]["access_count"] += 1
+            self.partition_stats[partition_name]["last_accessed"] = time.time()
+        
+        # 获取分区中的所有节点
+        with self.partition_locks[partition_name]:
+            node_keys = list(self.partitions[partition_name])
+        
+        # 获取节点对象并应用过滤器
+        for key in node_keys:
+            node = self.get_node_by_key(key)
+            if node:
+                if filter_func is None or filter_func(node):
+                    results.append(node)
+        
+        # 更新命中率统计
+        if partition_name in self.partition_stats and len(node_keys) > 0:
+            hit_ratio = len(results) / len(node_keys)
+            # 使用移动平均更新命中率
+            current_ratio = self.partition_stats[partition_name]["hit_ratio"]
+            self.partition_stats[partition_name]["hit_ratio"] = 0.9 * current_ratio + 0.1 * hit_ratio
+        
+        return results
     
     def get_node_by_key(self, key):
         """通过键获取节点"""
@@ -841,10 +2089,16 @@ class ION:
     
     def get_node_by_value(self, val):
         """通过值获取节点"""
-        key = self.bimap.get_by_value(val)
-        if key:
-            return self.get_node_by_key(key)
-        
+        keys = self.bimap.get_by_value(val)
+        if keys:
+            # 如果返回的是一个集合，取第一个键
+            if isinstance(keys, set) and keys:
+                key = next(iter(keys))
+                return self.get_node_by_key(key)
+            # 如果返回的是单个键
+            elif not isinstance(keys, set):
+                return self.get_node_by_key(keys)
+    
         # 如果双向映射未找到，则遍历搜索
         for bucket in self.buckets:
             for node in bucket:
@@ -1740,17 +2994,37 @@ class ION:
         # 预先检查是否需要扩容
         if self.count + len(node_data_list) > self.size * self.load_factor_threshold:
             self._resize(self.size * 2)
-            
-        return self.parallel_batch_process(
-            node_data_list,
-            lambda data: self.create_node(
-                data['key'], 
-                data['val'], 
-                data.get('metadata'),
-                data.get('tags'),
-                data.get('weight', 1.0)
-            )
-        )
+        
+        # 处理传入的不同数据格式
+        def process_node_data(data):
+            # 处理元组格式 (key, val) 或 (key, val, metadata)
+            if isinstance(data, tuple):
+                if len(data) == 2:
+                    return self.create_node(data[0], data[1])
+                elif len(data) == 3:
+                    return self.create_node(data[0], data[1], data[2])
+                elif len(data) >= 4:
+                    return self.create_node(data[0], data[1], data[2], data[3])
+                else:
+                    print(f"错误：元组数据格式不正确 {data}")
+                    return None
+            # 处理字典格式 {'key': key, 'val': val, ...}
+            elif isinstance(data, dict):
+                if 'key' not in data:
+                    print(f"错误：字典数据缺少'key'字段 {data}")
+                    return None
+                return self.create_node(
+                    data['key'], 
+                    data.get('val'),
+                    data.get('metadata'),
+                    data.get('tags'),
+                    data.get('weight', 1.0)
+                )
+            else:
+                print(f"错误：不支持的数据类型 {type(data)}")
+                return None
+        
+        return self.parallel_batch_process(node_data_list, process_node_data)
         
     def batch_add_relationships(self, relationship_list):
         """批量添加关系"""
@@ -3897,8 +5171,8 @@ class ION:
             # 如果创建了临时执行器，关闭它
             if max_workers:
                 executor.shutdown()
-                
-        return results
+                    
+            return results
         
     def _process_nodes_batch(self, nodes_batch, processor_func):
         """处理节点批次"""
@@ -4247,323 +5521,323 @@ class ION:
         print(f"审计日志: {log_entry}")
 
 # 新增的安全异常类
-class PermissionError(Exception):
-    """权限错误，表示用户没有执行操作的权限"""
-    pass
+    class PermissionError(Exception):
+        """权限错误，表示用户没有执行操作的权限"""
+        pass
 
 # 在ION类中添加以下方法
 
-def astar_search_in_transaction(self, txn_id, start, goal, heuristic_func=None,
-                               weight_func=None, rel_type=None, max_iterations=10000):
-    """
-    在事务中执行A*搜索算法
-    
-    参数:
-        txn_id: 事务ID
-        start: 起始节点或节点键
-        goal: 目标节点或节点键
-        heuristic_func: 启发函数
-        weight_func: 权重函数
-        rel_type: 关系类型
-        max_iterations: 最大迭代次数
+    def astar_search_in_transaction(self, txn_id, start, goal, heuristic_func=None,
+                                   weight_func=None, rel_type=None, max_iterations=10000):
+        """
+        在事务中执行A*搜索算法
         
-    返回:
-        (path, cost): 路径和总成本的元组
-    """
-    transaction = self.get_transaction(txn_id)
-    if not transaction:
-        raise TransactionError(f"事务不存在: {txn_id}")
-        
-    # 获取节点对象，并记录读取操作
-    start_node = self._get_node_from_input_with_txn(txn_id, start)
-    goal_node = self._get_node_from_input_with_txn(txn_id, goal)
-    
-    if not start_node or not goal_node:
-        return None, float('inf')
-        
-    # 在悲观并发控制模式下获取路径上可能的节点的锁
-    if self.concurrency_mode == 'pessimistic':
-        # 对起点和终点获取共享锁
-        if transaction.isolation_level in (IsolationLevel.REPEATABLE_READ, IsolationLevel.SERIALIZABLE):
-            self.acquire_read_lock(txn_id, start_node.key, transaction.timeout)
-            self.acquire_read_lock(txn_id, goal_node.key, transaction.timeout)
-    
-    # 执行A*搜索
-    return self.astar_search(start_node, goal_node, heuristic_func, weight_func, rel_type, max_iterations)
-
-def _get_node_from_input_with_txn(self, txn_id, input_data):
-    """在事务中从各种输入类型获取节点，并记录读取"""
-    node = self._get_node_from_input(input_data)
-    if node:
-        # 记录读取操作
+        参数:
+            txn_id: 事务ID
+            start: 起始节点或节点键
+            goal: 目标节点或节点键
+            heuristic_func: 启发函数
+            weight_func: 权重函数
+            rel_type: 关系类型
+            max_iterations: 最大迭代次数
+            
+        返回:
+            (path, cost): 路径和总成本的元组
+        """
         transaction = self.get_transaction(txn_id)
-        if transaction:
-            transaction.add_log_entry('read', node_key=node.key)
-    return node
-
-def astar_search_advanced_in_transaction(self, txn_id, start, goal, options=None):
-    """
-    在事务中执行高级A*搜索
-    
-    参数:
-        txn_id: 事务ID
-        start: 起始节点或节点键
-        goal: 目标节点或节点键
-        options: 搜索选项
-        
-    返回:
-        (path, cost, stats): 路径、成本和统计信息的元组
-    """
-    transaction = self.get_transaction(txn_id)
-    if not transaction:
-        raise TransactionError(f"事务不存在: {txn_id}")
-        
-    # 获取节点对象，并记录读取操作
-    start_node = self._get_node_from_input_with_txn(txn_id, start)
-    
-    # 处理多目标情况
-    if options and options.get('multi_goal') and isinstance(goal, (list, tuple, set)):
-        goal_nodes = [self._get_node_from_input_with_txn(txn_id, g) for g in goal]
-        goal_nodes = [g for g in goal_nodes if g is not None]
-    else:
+        if not transaction:
+            raise TransactionError(f"事务不存在: {txn_id}")
+            
+        # 获取节点对象，并记录读取操作
+        start_node = self._get_node_from_input_with_txn(txn_id, start)
         goal_node = self._get_node_from_input_with_txn(txn_id, goal)
-        goal_nodes = [goal_node] if goal_node else []
         
-    if not goal_nodes or not start_node:
-        return None, float('inf'), {}
-        
-    # 在悲观并发控制模式下获取锁
-    if self.concurrency_mode == 'pessimistic':
-        # 对起点和终点获取共享锁
-        if transaction.isolation_level in (IsolationLevel.REPEATABLE_READ, IsolationLevel.SERIALIZABLE):
-            self.acquire_read_lock(txn_id, start_node.key, transaction.timeout)
-            for goal_node in goal_nodes:
+        if not start_node or not goal_node:
+            return None, float('inf')
+            
+        # 在悲观并发控制模式下获取路径上可能的节点的锁
+        if self.concurrency_mode == 'pessimistic':
+            # 对起点和终点获取共享锁
+            if transaction.isolation_level in (IsolationLevel.REPEATABLE_READ, IsolationLevel.SERIALIZABLE):
+                self.acquire_read_lock(txn_id, start_node.key, transaction.timeout)
                 self.acquire_read_lock(txn_id, goal_node.key, transaction.timeout)
-    
-    # 执行高级A*搜索
-    return self.astar_search_advanced(start_node, goal_nodes if len(goal_nodes) > 1 else goal_nodes[0], options)
-
-# ---- 性能优化方法 ----
-
-def optimize_for_path_finding(self, max_cached_paths=1000):
-    """
-    优化路径查找性能
-    
-    参数:
-        max_cached_paths: 最大缓存路径数
         
-    返回:
-        self
-    """
-    # 初始化路径缓存
-    self.path_cache = {}
-    self.path_cache_max_size = max_cached_paths
-    self.path_cache_hits = 0
-    self.path_cache_misses = 0
+        # 执行A*搜索
+        return self.astar_search(start_node, goal_node, heuristic_func, weight_func, rel_type, max_iterations)
     
-    # 创建路径索引
-    self._build_path_indices()
+    def _get_node_from_input_with_txn(self, txn_id, input_data):
+        """在事务中从各种输入类型获取节点，并记录读取"""
+        node = self._get_node_from_input(input_data)
+        if node:
+            # 记录读取操作
+            transaction = self.get_transaction(txn_id)
+            if transaction:
+                transaction.add_log_entry('read', node_key=node.key)
+        return node
     
-    return self
-
-def _build_path_indices(self):
-    """构建路径索引以加速路径查找"""
-    # 初始化路径索引结构
-    self.path_indices = {
-        'hubs': set(),  # 高连接度节点（枢纽）
-        'shortcuts': {},  # 节点对之间的快捷路径
-        'communities': []  # 社区或集群
-    }
-    
-    # 识别高连接度节点（枢纽）
-    hub_nodes = self.find_most_connected(top_n=int(self.count * 0.05) or 10)  # 取前5%的高连接度节点
-    for node in hub_nodes:
-        if len(node.r) > 5:  # 至少有5个连接才算枢纽
-            self.path_indices['hubs'].add(node)
-    
-    # 为高连接度节点之间预计算路径
-    for hub1 in self.path_indices['hubs']:
-        for hub2 in self.path_indices['hubs']:
-            if hub1 != hub2:
-                path, cost = self.astar_search(hub1, hub2)
-                if path:
-                    key = (hub1.key, hub2.key)
-                    self.path_indices['shortcuts'][key] = (path, cost)
-    
-    # 识别社区结构
-    if self.start:
-        self.path_indices['communities'] = [self.get_community(start) for start in self.start]
-    
-    print(f"路径索引已构建: {len(self.path_indices['hubs'])} 个枢纽, "
-          f"{len(self.path_indices['shortcuts'])} 个快捷路径, "
-          f"{len(self.path_indices['communities'])} 个社区")
-
-def cached_astar_search(self, start, goal, heuristic_func=None, weight_func=None, rel_type=None, 
-                       max_iterations=10000, bypass_cache=False):
-    """
-    带缓存的A*搜索，利用预计算的路径和缓存加速搜索
-    
-    参数:
-        start: 起始节点或键
-        goal: 目标节点或键
-        heuristic_func, weight_func, rel_type, max_iterations: 与astar_search相同
-        bypass_cache: 是否绕过缓存直接搜索
+    def astar_search_advanced_in_transaction(self, txn_id, start, goal, options=None):
+        """
+        在事务中执行高级A*搜索
         
-    返回:
-        (path, cost): 路径和成本的元组
-    """
-    # 检查是否启用了缓存
-    if not hasattr(self, 'path_cache'):
-        return self.astar_search(start, goal, heuristic_func, weight_func, rel_type, max_iterations)
-    
-    # 获取节点对象
-    start_node = self._get_node_from_input(start)
-    goal_node = self._get_node_from_input(goal)
-    
-    if not start_node or not goal_node:
-        return None, float('inf')
-    
-    # 生成缓存键
-    cache_key = (start_node.key, goal_node.key, rel_type)
-    
-    # 如果不绕过缓存，先检查缓存
-    if not bypass_cache and cache_key in self.path_cache:
-        self.path_cache_hits += 1
-        return self.path_cache[cache_key]
-    
-    # 检查是否可以使用快捷路径
-    if not bypass_cache:
-        # 如果起点和终点都是枢纽，直接使用预计算的路径
-        if start_node in self.path_indices['hubs'] and goal_node in self.path_indices['hubs']:
-            shortcut_key = (start_node.key, goal_node.key)
-            if shortcut_key in self.path_indices['shortcuts']:
-                self.path_cache_hits += 1
-                return self.path_indices['shortcuts'][shortcut_key]
-        
-        # 如果起点和终点分别连接到不同的枢纽，尝试通过枢纽路径
-        start_hubs = [n['node'] for n in start_node.r if n['node'] in self.path_indices['hubs']]
-        goal_hubs = [n['node'] for n in goal_node.r if n['node'] in self.path_indices['hubs']]
-        
-        if start_hubs and goal_hubs:
-            best_path = None
-            best_cost = float('inf')
+        参数:
+            txn_id: 事务ID
+            start: 起始节点或节点键
+            goal: 目标节点或节点键
+            options: 搜索选项
             
-            for start_hub in start_hubs:
-                for goal_hub in goal_hubs:
-                    # 检查枢纽间是否有快捷路径
-                    hub_key = (start_hub.key, goal_hub.key)
-                    if hub_key in self.path_indices['shortcuts']:
-                        hub_path, hub_cost = self.path_indices['shortcuts'][hub_key]
-                        
-                        # 计算完整路径成本
-                        start_to_hub_cost = self._calculate_edge_cost(start_node, start_hub, weight_func)
-                        hub_to_goal_cost = self._calculate_edge_cost(goal_hub, goal_node, weight_func)
-                        total_cost = start_to_hub_cost + hub_cost + hub_to_goal_cost
-                        
-                        if total_cost < best_cost:
-                            # 构建完整路径
-                            full_path = [start_node] + hub_path[1:-1] + [goal_node]
-                            best_path = full_path
-                            best_cost = total_cost
+        返回:
+            (path, cost, stats): 路径、成本和统计信息的元组
+        """
+        transaction = self.get_transaction(txn_id)
+        if not transaction:
+            raise TransactionError(f"事务不存在: {txn_id}")
             
-            if best_path:
-                # 缓存并返回结果
-                self.path_cache[cache_key] = (best_path, best_cost)
-                # 维护缓存大小
-                if len(self.path_cache) > self.path_cache_max_size:
-                    self._prune_path_cache()
-                return best_path, best_cost
-    
-    # 如果没有找到缓存或快捷路径，执行常规A*搜索
-    self.path_cache_misses += 1
-    path, cost = self.astar_search(start_node, goal_node, heuristic_func, weight_func, rel_type, max_iterations)
-    
-    # 缓存结果（如果找到路径）
-    if path:
-        self.path_cache[cache_key] = (path, cost)
-        # 维护缓存大小
-        if len(self.path_cache) > self.path_cache_max_size:
-            self._prune_path_cache()
-    
-    return path, cost
+        # 获取节点对象，并记录读取操作
+        start_node = self._get_node_from_input_with_txn(txn_id, start)
+        
+        # 处理多目标情况
+        if options and options.get('multi_goal') and isinstance(goal, (list, tuple, set)):
+            goal_nodes = [self._get_node_from_input_with_txn(txn_id, g) for g in goal]
+            goal_nodes = [g for g in goal_nodes if g is not None]
+        else:
+            goal_node = self._get_node_from_input_with_txn(txn_id, goal)
+            goal_nodes = [goal_node] if goal_node else []
+            
+        if not goal_nodes or not start_node:
+            return None, float('inf'), {}
+            
+        # 在悲观并发控制模式下获取锁
+        if self.concurrency_mode == 'pessimistic':
+            # 对起点和终点获取共享锁
+            if transaction.isolation_level in (IsolationLevel.REPEATABLE_READ, IsolationLevel.SERIALIZABLE):
+                self.acquire_read_lock(txn_id, start_node.key, transaction.timeout)
+                for goal_node in goal_nodes:
+                    self.acquire_read_lock(txn_id, goal_node.key, transaction.timeout)
+        
+        # 执行高级A*搜索
+        return self.astar_search_advanced(start_node, goal_nodes if len(goal_nodes) > 1 else goal_nodes[0], options)
 
-def _calculate_edge_cost(self, node1, node2, weight_func=None):
-    """计算两个相邻节点之间的边成本"""
-    # 默认权重函数
-    if weight_func is None:
-        def default_weight_func(current, next_node, relation):
-            return relation.get('weight', 1.0)
-        weight_func = default_weight_func
+    # ---- 性能优化方法 ----
     
-    # 查找从node1到node2的关系
-    for relation in node1.r:
-        if relation['node'] == node2:
-            return weight_func(node1, node2, relation)
+    def optimize_for_path_finding(self, max_cached_paths=1000):
+        """
+        优化路径查找性能
+        
+        参数:
+            max_cached_paths: 最大缓存路径数
+            
+        返回:
+            self
+        """
+        # 初始化路径缓存
+        self.path_cache = {}
+        self.path_cache_max_size = max_cached_paths
+        self.path_cache_hits = 0
+        self.path_cache_misses = 0
+        
+        # 创建路径索引
+        self._build_path_indices()
+        
+        return self
     
-    # 如果没有直接关系，返回默认成本
-    return 1.0
-
-def _prune_path_cache(self):
-    """维护路径缓存大小"""
-    # 简单策略：移除最旧的20%的条目
-    num_to_remove = max(1, int(len(self.path_cache) * 0.2))
-    keys_to_remove = list(self.path_cache.keys())[:num_to_remove]
-    
-    for key in keys_to_remove:
-        del self.path_cache[key]
-
-def get_path_finding_stats(self):
-    """获取路径查找统计信息"""
-    if not hasattr(self, 'path_cache'):
-        return {
-            'cache_hits': 0,
-            'cache_misses': 0,
-            'total_queries': 0,
-            'hit_ratio': 0,
-            'cache_size': 0
+    def _build_path_indices(self):
+        """构建路径索引以加速路径查找"""
+        # 初始化路径索引结构
+        self.path_indices = {
+            'hubs': set(),  # 高连接度节点（枢纽）
+            'shortcuts': {},  # 节点对之间的快捷路径
+            'communities': []  # 社区或集群
         }
-            
-    total = self.path_cache_hits + self.path_cache_misses
-    hit_ratio = self.path_cache_hits / total if total > 0 else 0
-    
-    return {
-        'cache_hits': self.path_cache_hits,
-        'cache_misses': self.path_cache_misses,
-        'total_queries': total,
-        'hit_ratio': hit_ratio,
-        'cache_size': len(self.path_cache) if hasattr(self, 'path_cache') else 0
-    }
-
-def invalidate_path_cache(self, node_keys=None):
-    """
-    使路径缓存失效
-    
-    参数:
-        node_keys: 要使相关缓存失效的节点键列表，None表示清空所有缓存
         
-    返回:
-        移除的缓存条目数
-    """
-    if not hasattr(self, 'path_cache'):
-        return 0
+        # 识别高连接度节点（枢纽）
+        hub_nodes = self.find_most_connected(top_n=int(self.count * 0.05) or 10)  # 取前5%的高连接度节点
+        for node in hub_nodes:
+            if len(node.r) > 5:  # 至少有5个连接才算枢纽
+                self.path_indices['hubs'].add(node)
+        
+        # 为高连接度节点之间预计算路径
+        for hub1 in self.path_indices['hubs']:
+            for hub2 in self.path_indices['hubs']:
+                if hub1 != hub2:
+                    path, cost = self.astar_search(hub1, hub2)
+                    if path:
+                        key = (hub1.key, hub2.key)
+                        self.path_indices['shortcuts'][key] = (path, cost)
+        
+        # 识别社区结构
+        if self.start:
+            self.path_indices['communities'] = [self.get_community(start) for start in self.start]
+        
+        print(f"路径索引已构建: {len(self.path_indices['hubs'])} 个枢纽, "
+              f"{len(self.path_indices['shortcuts'])} 个快捷路径, "
+              f"{len(self.path_indices['communities'])} 个社区")
     
-    if node_keys is None:
-        # 清空整个缓存
-        count = len(self.path_cache)
-        self.path_cache.clear()
-        return count
-    else:
-        # 只清除涉及指定节点的缓存
-        keys_to_remove = []
-        for cache_key in self.path_cache:
-            start_key, end_key, _ = cache_key
-            if start_key in node_keys or end_key in node_keys:
-                keys_to_remove.append(cache_key)
+    def cached_astar_search(self, start, goal, heuristic_func=None, weight_func=None, rel_type=None, 
+                           max_iterations=10000, bypass_cache=False):
+        """
+        带缓存的A*搜索，利用预计算的路径和缓存加速搜索
+        
+        参数:
+            start: 起始节点或键
+            goal: 目标节点或键
+            heuristic_func, weight_func, rel_type, max_iterations: 与astar_search相同
+            bypass_cache: 是否绕过缓存直接搜索
+            
+        返回:
+            (path, cost): 路径和成本的元组
+        """
+        # 检查是否启用了缓存
+        if not hasattr(self, 'path_cache'):
+            return self.astar_search(start, goal, heuristic_func, weight_func, rel_type, max_iterations)
+        
+        # 获取节点对象
+        start_node = self._get_node_from_input(start)
+        goal_node = self._get_node_from_input(goal)
+        
+        if not start_node or not goal_node:
+            return None, float('inf')
+        
+        # 生成缓存键
+        cache_key = (start_node.key, goal_node.key, rel_type)
+        
+        # 如果不绕过缓存，先检查缓存
+        if not bypass_cache and cache_key in self.path_cache:
+            self.path_cache_hits += 1
+            return self.path_cache[cache_key]
+        
+        # 检查是否可以使用快捷路径
+        if not bypass_cache:
+            # 如果起点和终点都是枢纽，直接使用预计算的路径
+            if start_node in self.path_indices['hubs'] and goal_node in self.path_indices['hubs']:
+                shortcut_key = (start_node.key, goal_node.key)
+                if shortcut_key in self.path_indices['shortcuts']:
+                    self.path_cache_hits += 1
+                    return self.path_indices['shortcuts'][shortcut_key]
+            
+            # 如果起点和终点分别连接到不同的枢纽，尝试通过枢纽路径
+            start_hubs = [n['node'] for n in start_node.r if n['node'] in self.path_indices['hubs']]
+            goal_hubs = [n['node'] for n in goal_node.r if n['node'] in self.path_indices['hubs']]
+            
+            if start_hubs and goal_hubs:
+                best_path = None
+                best_cost = float('inf')
+                
+                for start_hub in start_hubs:
+                    for goal_hub in goal_hubs:
+                        # 检查枢纽间是否有快捷路径
+                        hub_key = (start_hub.key, goal_hub.key)
+                        if hub_key in self.path_indices['shortcuts']:
+                            hub_path, hub_cost = self.path_indices['shortcuts'][hub_key]
+                            
+                            # 计算完整路径成本
+                            start_to_hub_cost = self._calculate_edge_cost(start_node, start_hub, weight_func)
+                            hub_to_goal_cost = self._calculate_edge_cost(goal_hub, goal_node, weight_func)
+                            total_cost = start_to_hub_cost + hub_cost + hub_to_goal_cost
+                            
+                            if total_cost < best_cost:
+                                # 构建完整路径
+                                full_path = [start_node] + hub_path[1:-1] + [goal_node]
+                                best_path = full_path
+                                best_cost = total_cost
+                
+                if best_path:
+                    # 缓存并返回结果
+                    self.path_cache[cache_key] = (best_path, best_cost)
+                    # 维护缓存大小
+                    if len(self.path_cache) > self.path_cache_max_size:
+                        self._prune_path_cache()
+                    return best_path, best_cost
+        
+        # 如果没有找到缓存或快捷路径，执行常规A*搜索
+        self.path_cache_misses += 1
+        path, cost = self.astar_search(start_node, goal_node, heuristic_func, weight_func, rel_type, max_iterations)
+        
+        # 缓存结果（如果找到路径）
+        if path:
+            self.path_cache[cache_key] = (path, cost)
+            # 维护缓存大小
+            if len(self.path_cache) > self.path_cache_max_size:
+                self._prune_path_cache()
+        
+        return path, cost
+    
+    def _calculate_edge_cost(self, node1, node2, weight_func=None):
+        """计算两个相邻节点之间的边成本"""
+        # 默认权重函数
+        if weight_func is None:
+            def default_weight_func(current, next_node, relation):
+                return relation.get('weight', 1.0)
+            weight_func = default_weight_func
+        
+        # 查找从node1到node2的关系
+        for relation in node1.r:
+            if relation['node'] == node2:
+                return weight_func(node1, node2, relation)
+        
+        # 如果没有直接关系，返回默认成本
+        return 1.0
+    
+    def _prune_path_cache(self):
+        """维护路径缓存大小"""
+        # 简单策略：移除最旧的20%的条目
+        num_to_remove = max(1, int(len(self.path_cache) * 0.2))
+        keys_to_remove = list(self.path_cache.keys())[:num_to_remove]
         
         for key in keys_to_remove:
             del self.path_cache[key]
+    
+    def get_path_finding_stats(self):
+        """获取路径查找统计信息"""
+        if not hasattr(self, 'path_cache'):
+            return {
+                'cache_hits': 0,
+                'cache_misses': 0,
+                'total_queries': 0,
+                'hit_ratio': 0,
+                'cache_size': 0
+            }
+                
+        total = self.path_cache_hits + self.path_cache_misses
+        hit_ratio = self.path_cache_hits / total if total > 0 else 0
+        
+        return {
+            'cache_hits': self.path_cache_hits,
+            'cache_misses': self.path_cache_misses,
+            'total_queries': total,
+            'hit_ratio': hit_ratio,
+            'cache_size': len(self.path_cache) if hasattr(self, 'path_cache') else 0
+        }
+
+    def invalidate_path_cache(self, node_keys=None):
+        """
+        使路径缓存失效
+        
+        参数:
+            node_keys: 要使相关缓存失效的节点键列表，None表示清空所有缓存
             
-        return len(keys_to_remove)
+        返回:
+            移除的缓存条目数
+        """
+        if not hasattr(self, 'path_cache'):
+            return 0
+        
+        if node_keys is None:
+            # 清空整个缓存
+            count = len(self.path_cache)
+            self.path_cache.clear()
+            return count
+        else:
+            # 只清除涉及指定节点的缓存
+            keys_to_remove = []
+            for cache_key in self.path_cache:
+                start_key, end_key, _ = cache_key
+                if start_key in node_keys or end_key in node_keys:
+                    keys_to_remove.append(cache_key)
+            
+            for key in keys_to_remove:
+                del self.path_cache[key]
+                
+            return len(keys_to_remove)
     
     @staticmethod
     def performance_monitor(func):
@@ -4655,7 +5929,150 @@ def invalidate_path_cache(self, node_keys=None):
         for bucket in self.buckets:
             for node in bucket:
                 self._index_node_to_compound(node, index_types)
-    
+    def _async_indexing_worker(self):
+        """异步索引更新工作线程，处理索引队列中的操作"""
+        while self.async_indexing:
+            try:
+                # 如果队列为空，等待一小段时间
+                if not self.indexing_queue:
+                    import time
+                    time.sleep(0.01)
+                    continue
+                
+                # 获取下一个索引操作
+                try:
+                    operation = self.indexing_queue.popleft()
+                except IndexError:
+                    # 队列可能在检查后变为空
+                    continue
+                
+                # 处理操作
+                op_type = operation.get('type')
+                node = operation.get('node')
+                data = operation.get('data')
+                
+                if op_type == 'add':
+                    # 添加节点到索引
+                    if node:
+                        # 添加到双向映射
+                        self.bimap.add(node.key, node.val)
+                        
+                        # 添加到组合数据结构
+                        self._combined_data.put(node.key, node.val, metadata=node.metadata)
+                        
+                        # 索引元数据
+                        if node.metadata:
+                            for m_key, m_val in node.metadata.items():
+                                self._index_metadata(m_key, m_val, node)
+                        
+                        # 索引标签
+                        if node.tags:
+                            for tag in node.tags:
+                                self._index_tag(tag, node)
+                                
+                        # 索引值类型
+                        self._index_value_type(node.val, node)
+                        
+                        # 添加到复合索引
+                        for index_types in self.compound_index_types:
+                            self._index_node_to_compound(node, index_types)
+                
+                elif op_type == 'remove':
+                    # 从索引中移除节点
+                    if node:
+                        self._cleanup_node_indices(node)
+                        
+                        # 从复合索引中移除
+                        self._remove_node_from_compound_indices(node)
+                        
+                        # 从组合数据结构中删除
+                        self._combined_data.delete(node.key, keep_relationships=False)
+                
+                elif op_type == 'update':
+                    # 更新索引
+                    if node and data:
+                        field = data.get('field')
+                        old_value = data.get('old_value')
+                        new_value = data.get('new_value')
+                        
+                        if field == 'metadata':
+                            # 从复合索引中移除节点
+                            self._remove_node_from_compound_indices(node)
+                            
+                            # 更新元数据索引
+                            if old_value:
+                                for meta_key, meta_val in old_value.items():
+                                    if meta_key not in new_value or new_value[meta_key] != meta_val:
+                                        self._remove_metadata_index(meta_key, meta_val, node)
+                            
+                            # 添加新索引
+                            if new_value:
+                                for meta_key, meta_val in new_value.items():
+                                    if meta_key not in old_value or old_value[meta_key] != meta_val:
+                                        self._index_metadata(meta_key, meta_val, node)
+                            
+                            # 重新添加到复合索引
+                            for index_types in self.compound_index_types:
+                                self._index_node_to_compound(node, index_types)
+                        
+                        elif field == 'tag':
+                            # 从复合索引中移除节点
+                            self._remove_node_from_compound_indices(node)
+                            
+                            # 更新标签索引
+                            added_tags = set(new_value or []) - set(old_value or [])
+                            removed_tags = set(old_value or []) - set(new_value or [])
+                            
+                            for tag in removed_tags:
+                                self._remove_tag_index(tag, node)
+                            
+                            for tag in added_tags:
+                                self._index_tag(tag, node)
+                            
+                            # 重新添加到复合索引
+                            for index_types in self.compound_index_types:
+                                self._index_node_to_compound(node, index_types)
+                        
+                        elif field == 'value':
+                            # 从复合索引中移除节点
+                            self._remove_node_from_compound_indices(node)
+                            
+                            # 更新值和值类型索引
+                            old_type = type(old_value).__name__ if old_value is not None else None
+                            new_type = type(new_value).__name__ if new_value is not None else None
+                            
+                            # 更新双向映射
+                            self.bimap.remove(node.key)
+                            self.bimap.add(node.key, new_value)
+                            
+                            # 更新值类型索引
+                            if old_type != new_type:
+                                if old_type and old_type in self.value_type_index and node in self.value_type_index[old_type]:
+                                    self.value_type_index[old_type].remove(node)
+                                    if not self.value_type_index[old_type]:
+                                        del self.value_type_index[old_type]
+                                
+                                self._index_value_type(new_value, node)
+                            
+                            # 更新组合数据结构
+                            self._combined_data.put(node.key, new_value, metadata=node.metadata)
+                            
+                            # 重新添加到复合索引
+                            for index_types in self.compound_index_types:
+                                self._index_node_to_compound(node, index_types)
+                        
+                        elif field == 'weight':
+                            # 从复合索引中移除节点
+                            self._remove_node_from_compound_indices(node)
+                            
+                            # 重新添加到复合索引
+                            for index_types in self.compound_index_types:
+                                self._index_node_to_compound(node, index_types)
+                
+            except Exception as e:
+                import logging
+                logging.error(f"异步索引更新错误: {e}")
+                # 继续处理下一个操作，不要因为一个错误就退出循环
     def _index_node_to_compound(self, node, index_types):
         """
         将节点添加到复合索引
@@ -4922,253 +6339,108 @@ def invalidate_path_cache(self, node_keys=None):
             node: 相关节点
             data: 额外数据，如元数据、标签等
         """
-        with self.index_update_lock:
-            # 添加到更新队列
-            self.index_update_queue.append({
-                'type': update_type,
-                'node': node,
-                'data': data,
-                'timestamp': time.time()
-            })
+        # 添加到生物图(bimap)
+        if update_type == 'add':
+            self.bimap.add(node.key, node.val)
             
-            # 如果队列长度达到阈值，触发批量更新
-            if len(self.index_update_queue) >= self.index_update_threshold:
-                self._process_index_updates()
-                
-            # 设置定时更新任务
-            if self.index_update_timer is None:
-                def trigger_update():
-                    with self.index_update_lock:
-                        self.index_update_timer = None
-                        if self.index_update_queue:
-                            self._process_index_updates()
-                
-                import threading
-                self.index_update_timer = threading.Timer(self.index_update_interval, trigger_update)
-                self.index_update_timer.daemon = True
-                self.index_update_timer.start()
-    
-    def _process_index_updates(self):
-        """处理队列中的索引更新操作"""
-        if self.is_updating_indices:
-            return  # 避免并发更新
+            # 添加到组合数据结构
+            self._combined_data.put(node.key, node.val, metadata=node.metadata)
             
-        self.is_updating_indices = True
-        try:
-            with self.index_update_lock:
-                updates = self.index_update_queue
-                self.index_update_queue = []
-                
-            # 按类型分组更新操作
-            grouped_updates = {
-                'metadata_add': [],
-                'metadata_remove': [],
-                'tag_add': [],
-                'tag_remove': [],
-                'value_type_add': [],
-                'value_type_remove': [],
-                'compound_add': [],
-                'compound_remove': []
-            }
+            # 索引元数据
+            if node.metadata:
+                for m_key, m_val in node.metadata.items():
+                    self._index_metadata(m_key, m_val, node)
             
-            # 整理更新操作
-            for update in updates:
-                update_type = update['type']
-                node = update['node']
-                data = update['data']
+            # 索引标签
+            if node.tags:
+                for tag in node.tags:
+                    self._index_tag(tag, node)
+                    
+            # 索引值类型
+            self._index_value_type(node.val, node)
+            
+        elif update_type == 'remove':
+            # 清理索引
+            self._cleanup_node_indices(node)
+            
+            # 从组合数据结构中删除
+            self._combined_data.delete(node.key, keep_relationships=False)
+            
+        elif update_type == 'update':
+            # 更新相关索引
+            if data and 'field' in data and 'old_value' in data and 'new_value' in data:
+                field = data['field']
+                old_value = data['old_value']
+                new_value = data['new_value']
                 
-                if update_type == 'add':
-                    # 添加节点索引
-                    if node.metadata:
-                        for meta_key, meta_val in node.metadata.items():
-                            grouped_updates['metadata_add'].append((meta_key, meta_val, node))
-                    
-                    if node.tags:
-                        for tag in node.tags:
-                            grouped_updates['tag_add'].append((tag, node))
-                    
-                    value_type = type(node.val).__name__
-                    grouped_updates['value_type_add'].append((value_type, node))
-                    
-                    # 添加到复合索引
-                    grouped_updates['compound_add'].append(node)
-                    
-                elif update_type == 'remove':
-                    # 从所有索引中删除节点
-                    if node.metadata:
-                        for meta_key, meta_val in node.metadata.items():
-                            grouped_updates['metadata_remove'].append((meta_key, meta_val, node))
-                    
-                    if node.tags:
-                        for tag in node.tags:
-                            grouped_updates['tag_remove'].append((tag, node))
-                    
-                    value_type = type(node.val).__name__
-                    grouped_updates['value_type_remove'].append((value_type, node))
-                    
-                    # 从复合索引中删除
-                    grouped_updates['compound_remove'].append(node)
-                    
-                elif update_type == 'metadata_update':
+                if field == 'metadata':
                     # 更新元数据索引
-                    old_metadata, new_metadata = data if data else ({}, {})
+                    old_metadata, new_metadata = old_value, new_value
                     
                     # 清除旧元数据的索引
                     if old_metadata:
                         for meta_key, meta_val in old_metadata.items():
-                            grouped_updates['metadata_remove'].append((meta_key, meta_val, node))
+                            self._remove_metadata_index(meta_key, meta_val, node)
                     
                     # 添加新元数据的索引
                     if new_metadata:
                         for meta_key, meta_val in new_metadata.items():
-                            grouped_updates['metadata_add'].append((meta_key, meta_val, node))
-                    
-                    # 更新复合索引
-                    grouped_updates['compound_remove'].append(node)
-                    grouped_updates['compound_add'].append(node)
-                    
-                elif update_type == 'tag_update':
+                            self._index_metadata(meta_key, meta_val, node)
+                            
+                elif field == 'tag':
                     # 更新标签索引
-                    old_tags, new_tags = data if data else (set(), set())
+                    if old_value and old_value in node.tags:
+                        self._remove_tag_index(old_value, node)
                     
-                    # 清除旧标签的索引
-                    for tag in old_tags:
-                        grouped_updates['tag_remove'].append((tag, node))
-                    
-                    # 添加新标签的索引
-                    for tag in new_tags:
-                        grouped_updates['tag_add'].append((tag, node))
-                    
-                    # 更新复合索引
-                    grouped_updates['compound_remove'].append(node)
-                    grouped_updates['compound_add'].append(node)
-                    
-                elif update_type == 'value_update':
-                    # 更新值类型索引
-                    old_type, new_type = data if data else (None, None)
-                    
-                    if old_type:
-                        grouped_updates['value_type_remove'].append((old_type, node))
-                    
-                    if new_type:
-                        grouped_updates['value_type_add'].append((new_type, node))
-                    
-                    # 更新复合索引
-                    grouped_updates['compound_remove'].append(node)
-                    grouped_updates['compound_add'].append(node)
-            
-            # 批量执行更新
-            self._batch_update_metadata_index(
-                grouped_updates['metadata_add'],
-                grouped_updates['metadata_remove']
-            )
-            
-            self._batch_update_tag_index(
-                grouped_updates['tag_add'],
-                grouped_updates['tag_remove']
-            )
-            
-            self._batch_update_value_type_index(
-                grouped_updates['value_type_add'],
-                grouped_updates['value_type_remove']
-            )
-            
-            self._batch_update_compound_index(
-                grouped_updates['compound_add'],
-                grouped_updates['compound_remove']
-            )
-            
-        finally:
-            self.is_updating_indices = False
-    
-    def _batch_update_metadata_index(self, additions, removals):
-        """批量更新元数据索引"""
-        with self.metadata_index_lock:
-            # 处理删除
-            for meta_key, meta_val, node in removals:
-                key = f"{meta_key}:{meta_val}"
-                if key in self.metadata_index and node in self.metadata_index[key]:
-                    self.metadata_index[key].remove(node)
-                    if not self.metadata_index[key]:
-                        del self.metadata_index[key]
-            
-            # 处理添加
-            for meta_key, meta_val, node in additions:
-                key = f"{meta_key}:{meta_val}"
-                if key not in self.metadata_index:
-                    self.metadata_index[key] = []
-                if node not in self.metadata_index[key]:
-                    self.metadata_index[key].append(node)
-    
-    def _batch_update_tag_index(self, additions, removals):
-        """批量更新标签索引"""
-        with self.tag_index_lock:
-            # 处理删除
-            for tag, node in removals:
-                if tag in self.tag_index and node in self.tag_index[tag]:
-                    self.tag_index[tag].remove(node)
-                    if not self.tag_index[tag]:
-                        del self.tag_index[tag]
-            
-            # 处理添加
-            for tag, node in additions:
-                if tag not in self.tag_index:
-                    self.tag_index[tag] = []
-                if node not in self.tag_index[tag]:
-                    self.tag_index[tag].append(node)
-    
-    def _batch_update_value_type_index(self, additions, removals):
-        """批量更新值类型索引"""
-        with self.value_type_index_lock:
-            # 处理删除
-            for value_type, node in removals:
-                if value_type in self.value_type_index and node in self.value_type_index[value_type]:
-                    self.value_type_index[value_type].remove(node)
-                    if not self.value_type_index[value_type]:
-                        del self.value_type_index[value_type]
-            
-            # 处理添加
-            for value_type, node in additions:
-                if value_type not in self.value_type_index:
-                    self.value_type_index[value_type] = []
-                if node not in self.value_type_index[value_type]:
-                    self.value_type_index[value_type].append(node)
-    
-    def _batch_update_compound_index(self, additions, removals):
-        """批量更新复合索引"""
-        with self.compound_index_lock:
-            # 处理删除
-            for node in removals:
-                self._remove_node_from_compound_indices(node)
-            
-            # 处理添加
-            for node in additions:
-                for index_types in self.compound_index_types:
-                    self._index_node_to_compound(node, index_types)
-    
-    # 修改索引更新方法，使用批量更新机制
-    def _index_metadata(self, meta_key, meta_val, node):
-        """为元数据创建索引"""
-        self._schedule_index_update('metadata_update', node, 
-                                   ({}, {meta_key: meta_val}))
-    
-    def _remove_metadata_index(self, meta_key, meta_val, node):
-        """移除元数据索引"""
-        self._schedule_index_update('metadata_update', node, 
-                                   ({meta_key: meta_val}, {}))
-    
-    def _index_tag(self, tag, node):
-        """为标签创建索引"""
-        self._schedule_index_update('tag_update', node, (set(), {tag}))
-    
-    def _remove_tag_index(self, tag, node):
-        """移除标签索引"""
-        self._schedule_index_update('tag_update', node, ({tag}, set()))
-    
-    def _index_value_type(self, value, node):
-        """为值类型创建索引"""
-        value_type = type(value).__name__
-        self._schedule_index_update('value_update', node, (None, value_type))
+                    if new_value:
+                        self._index_tag(new_value, node)
+                        
+                elif field == 'value':
+                    # 更新值和值类型索引
+                    if old_value != new_value:
+                        # 更新双向映射
+                        self.bimap.remove(node.key)
+                        self.bimap.add(node.key, new_value)
+                        
+                        # 更新值类型索引
+                        old_type = type(old_value).__name__
+                        new_type = type(new_value).__name__
+                        
+                        if old_type != new_type:
+                            if old_type in self.value_type_index and node in self.value_type_index[old_type]:
+                                self.value_type_index[old_type].remove(node)
+                                
+                            self._index_value_type(new_value, node)
+                        
+                        # 更新组合数据结构
+                        self._combined_data.put(node.key, new_value, metadata=node.metadata)
+                        
+    def _process_index_updates(self):
+        """处理索引更新队列中的操作"""
+        # 这个方法用于批量处理索引更新，但在这里我们暂时不需要实现具体的批处理逻辑
+        pass
+        
+    def _cleanup_node_indices(self, node):
+        """清理被删除节点的所有索引"""
+        # 清理双向映射
+        self.bimap.remove(node.key)
+        
+        # 清理元数据索引
+        if node.metadata:
+            for m_key, m_val in node.metadata.items():
+                self._remove_metadata_index(m_key, m_val, node)
+        
+        # 清理标签索引
+        if hasattr(node, 'tags') and node.tags:
+            for tag in node.tags:
+                self._remove_tag_index(tag, node)
+        
+        # 清理值类型索引
+        value_type = type(node.val).__name__
+        if value_type in self.value_type_index and node in self.value_type_index[value_type]:
+            self.value_type_index[value_type].remove(node)
+            if not self.value_type_index[value_type]:
+                del self.value_type_index[value_type]
     
     # 增强并发控制的锁粒度调整
     def find_by_metadata(self, meta_key, meta_val):
@@ -5416,4 +6688,321 @@ def invalidate_path_cache(self, node_keys=None):
             
         return dfs(start_txn)
 
+    def find_nodes_by_metadata(self, metadata_key, metadata_value=None):
+        """通过元数据查找节点，支持分区优化查询
+        
+        参数:
+            metadata_key: 元数据键
+            metadata_value: 可选的元数据值，如果为None则匹配所有具有该键的节点
+            
+        返回:
+            list: 匹配的节点列表
+        """
+        # 检查分区查询缓存
+        cache_key = f"metadata:{metadata_key}:{metadata_value}"
+        if self.parallel_query and hasattr(self, 'partition_query_cache'):
+            with self.partition_query_cache_lock:
+                if cache_key in self.partition_query_cache:
+                    cache_entry = self.partition_query_cache[cache_key]
+                    if time.time() - cache_entry['timestamp'] < 60:  # 缓存1分钟
+                        return cache_entry['result']
+        
+        # 确定要查询的分区
+        query_conditions = {metadata_key: metadata_value} if metadata_value is not None else {}
+        if self.partition_config["field"] == metadata_key:
+            # 如果查询的正好是分区字段，可以直接定位分区
+            partitions = self.get_partition_for_query(query_conditions)
+        else:
+            # 否则需要查询所有分区
+            partitions = list(self.partitions.keys())
+        
+        # 定义过滤函数
+        def metadata_filter(node):
+            if node.metadata and metadata_key in node.metadata:
+                if metadata_value is None:
+                    return True
+                return node.metadata[metadata_key] == metadata_value
+            return False
+        
+        # 从分区中获取节点
+        results = self._get_nodes_from_partitions(partitions, metadata_filter)
+        
+        # 更新缓存
+        if self.parallel_query and hasattr(self, 'partition_query_cache'):
+            with self.partition_query_cache_lock:
+                self.partition_query_cache[cache_key] = {
+                    'result': results,
+                    'timestamp': time.time()
+                }
+                
+                # 限制缓存大小
+                if len(self.partition_query_cache) > 100:
+                    # 删除最旧的缓存条目
+                    oldest_key = min(
+                        self.partition_query_cache.keys(),
+                        key=lambda k: self.partition_query_cache[k]['timestamp']
+                    )
+                    del self.partition_query_cache[oldest_key]
+        
+        return results
+    
+    def find_nodes_by_tag(self, tag):
+        """通过标签查找节点，支持分区优化查询
+        
+        参数:
+            tag: 要查找的标签
+            
+        返回:
+            list: 匹配的节点列表
+        """
+        # 检查分区查询缓存
+        cache_key = f"tag:{tag}"
+        if self.parallel_query and hasattr(self, 'partition_query_cache'):
+            with self.partition_query_cache_lock:
+                if cache_key in self.partition_query_cache:
+                    cache_entry = self.partition_query_cache[cache_key]
+                    if time.time() - cache_entry['timestamp'] < 60:  # 缓存1分钟
+                        return cache_entry['result']
+        
+        # 所有分区都需要查询
+        partitions = list(self.partitions.keys())
+        
+        # 定义过滤函数
+        def tag_filter(node):
+            return tag in (node.tags or [])
+        
+        # 从分区中获取节点
+        results = self._get_nodes_from_partitions(partitions, tag_filter)
+        
+        # 更新缓存
+        if self.parallel_query and hasattr(self, 'partition_query_cache'):
+            with self.partition_query_cache_lock:
+                self.partition_query_cache[cache_key] = {
+                    'result': results,
+                    'timestamp': time.time()
+                }
+                
+                # 限制缓存大小
+                if len(self.partition_query_cache) > 100:
+                    # 删除最旧的缓存条目
+                    oldest_key = min(
+                        self.partition_query_cache.keys(),
+                        key=lambda k: self.partition_query_cache[k]['timestamp']
+                    )
+                    del self.partition_query_cache[oldest_key]
+        
+        return results
+    
+    def find_nodes_by_filter(self, filter_func, partitions=None):
+        """通过过滤函数查找节点，支持限定分区范围
+        
+        参数:
+            filter_func: 过滤函数，接收一个节点参数，返回布尔值
+            partitions: 可选的分区名称列表，如果为None则查询所有分区
+            
+        返回:
+            list: 匹配的节点列表
+        """
+        # 确定要查询的分区
+        if partitions is None:
+            partitions = list(self.partitions.keys())
+        else:
+            # 验证分区名称
+            partitions = [p for p in partitions if p in self.partitions]
+            if not partitions:
+                return []  # 没有有效的分区
+        
+        # 从分区中获取节点
+        return self._get_nodes_from_partitions(partitions, filter_func)
+    
+    def clear_partition_cache(self):
+        """清除分区查询缓存"""
+        if self.parallel_query and hasattr(self, 'partition_query_cache'):
+            with self.partition_query_cache_lock:
+                self.partition_query_cache.clear()
+    
+    def optimize_data_distribution(self):
+        """优化数据分布，重新分配节点到合适的分区"""
+        if not self.auto_optimize:
+            return False
+            
+        with self.lock:
+            # 获取所有分区统计
+            stats = self.get_partition_stats()
+            
+            # 合并小分区
+            small_partitions = []
+            for name, stat in stats.items():
+                if name != "default" and name != "_summary" and stat.get("current_size", 0) < self.max_partition_size * 0.2:
+                    small_partitions.append(name)
+            
+            if len(small_partitions) >= 2:
+                self.merge_partitions(small_partitions)
+            
+            # 检查是否有不平衡的分区需要分裂
+            for name, stat in stats.items():
+                if name != "_summary" and stat.get("current_size", 0) > self.max_partition_size:
+                    self.split_partition(name)
+            
+            # 检查分区命中率，可能需要重新组织
+            low_hit_partitions = []
+            for name, stat in stats.items():
+                if name != "default" and name != "_summary" and stat.get("hit_ratio", 1.0) < 0.3:
+                    low_hit_partitions.append(name)
+            
+            if low_hit_partitions:
+                # 将低命中率分区中的节点重新分配
+                for partition_name in low_hit_partitions:
+                    with self.partition_locks[partition_name]:
+                        node_keys = list(self.partitions[partition_name])
+                        
+                    # 分批处理，避免锁定太长时间
+                    batch_size = 100
+                    for i in range(0, len(node_keys), batch_size):
+                        batch = node_keys[i:i+batch_size]
+                        for key in batch:
+                            node = self.get_node_by_key(key)
+                            if node and node.metadata and self.partition_config["field"] in node.metadata:
+                                # 重新计算适合的分区
+                                field_value = node.metadata[self.partition_config["field"]]
+                                if self.partition_config["strategy"] == "field":
+                                    new_partition = self.create_dynamic_partition(field_value)
+                                    self.assign_node_to_partition(node, new_partition)
+                        
+            return True
+
     # 基础方法实现
+    def _schedule_resize(self):
+        """计划扩容任务，直接调用_check_resize方法"""
+        self._check_resize()
+    
+    def remove_node_by_key_base(self, key):
+        """通过键删除节点的基本方法，不处理索引和事务"""
+        index = self.hf(key)
+        with self.bucket_locks[index]:
+            bucket = self.buckets[index]
+            for i, node in enumerate(bucket):
+                if node.key == key:
+                    removed = bucket.pop(i)
+                    self.count -= 1
+                    
+                    # 清理索引
+                    self._cleanup_node_indices(removed)
+                    
+                    # 从组合数据结构中删除
+                    self._combined_data.delete(key, keep_relationships=False)
+                    
+                    self._trigger_event('node_removed', node=removed)
+                    return removed
+        return None
+    # 添加被引用但缺失的基础方法
+    def update_node_metadata_base(self, node, new_metadata):
+        """更新节点的元数据并同步索引的基础实现"""
+        if not isinstance(new_metadata, dict):
+            raise TypeError("元数据必须是字典类型")
+            
+        old_metadata = node.metadata.copy() if node.metadata else {}
+        
+        # 如果节点没有metadata属性，初始化它
+        if node.metadata is None:
+            node._metadata = {}
+            
+        # 获取旧元数据的键值对
+        old_meta_pairs = set()
+        if old_metadata:
+            for key, value in old_metadata.items():
+                old_meta_pairs.add((key, value))
+        
+        # 更新节点的元数据
+        node._metadata.update(new_metadata)
+        
+        # 获取新元数据的键值对
+        new_meta_pairs = set()
+        for key, value in node.metadata.items():
+            new_meta_pairs.add((key, value))
+            
+        # 需要移除的元数据索引
+        to_remove = old_meta_pairs - new_meta_pairs
+        
+        # 需要添加的元数据索引
+        to_add = new_meta_pairs - old_meta_pairs
+        
+        # 移除旧的元数据索引
+        for meta_key, meta_val in to_remove:
+            self._remove_metadata_index(meta_key, meta_val, node)
+        
+        # 添加新的元数据索引
+        for meta_key, meta_val in to_add:
+            self._index_metadata(meta_key, meta_val, node)
+        
+        # 更新组合数据结构
+        self._combined_data.set_node_metadata(node.key, node.metadata)
+        
+        self._trigger_event('node_updated', node=node, metadata_changed=True)
+        
+        return node
+        
+    def update_node_tag_base(self, node, operation='add', tags=None, clear_existing=False):
+        """更新节点的标签的基础实现"""
+        # 获取节点对象
+        if not node:
+            raise ValueError(f"找不到节点")
+            
+        # 确保tags是可迭代的（如果是单个字符串，转换为列表）
+        if tags is not None:
+            if isinstance(tags, str):
+                tags = [tags]
+            elif not hasattr(tags, '__iter__'):
+                tags = [tags]  # 处理其他单个非迭代对象
+            
+        # 根据操作类型处理标签
+        if operation == 'add' and tags:
+            # 添加新标签
+            for tag in tags:
+                node.add_tag(tag)
+                
+        elif operation == 'remove' and tags:
+            # 移除指定标签
+            for tag in tags:
+                node.remove_tag(tag)
+                
+        elif operation == 'set':
+            # 如果需要清除现有标签
+            if clear_existing:
+                # 保存现有标签的副本，以便稍后清除索引
+                old_tags = set(node.tags)
+                
+                # 清空标签集合
+                node._tags.clear()
+                
+                # 移除旧标签的索引
+                for tag in old_tags:
+                    self._remove_tag_index(tag, node)
+            
+            # 设置新标签
+            if tags:
+                for tag in tags:
+                    node.add_tag(tag)
+                    
+        # 触发节点更新事件
+        self._trigger_event('node_updated', node=node, tags_changed=True)
+        
+        return node
+        
+    def update_node_weight_base(self, node, weight):
+        """更新节点的权重的基础实现"""
+        # 保存旧权重以便事件通知
+        old_weight = node.weight
+        
+        # 更新权重
+        try:
+            node.weight = float(weight)
+        except (TypeError, ValueError):
+            raise ValueError(f"权重必须是一个有效的数值: {weight}")
+            
+        # 触发节点更新事件
+        self._trigger_event('node_updated', node=node, old_weight=old_weight)
+        
+        return node
+        
+    
