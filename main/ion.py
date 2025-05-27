@@ -29,6 +29,447 @@ from bsd import ICombinedDataStructure, HashTable, NestedBidirectionalMap, Relat
 # 导入ond模块的核心类
 from ond import RNode, obj_to_number
 
+# 同步系统基础类和接口
+class SyncOperation(Enum):
+    """同步操作类型枚举"""
+    CREATE = 'create'           # 创建节点
+    UPDATE = 'update'           # 更新节点
+    DELETE = 'delete'           # 删除节点
+    ADD_RELATION = 'add_relation'       # 添加关系
+    REMOVE_RELATION = 'remove_relation' # 移除关系
+    BATCH_CREATE = 'batch_create'       # 批量创建
+    BATCH_UPDATE = 'batch_update'       # 批量更新
+    BATCH_DELETE = 'batch_delete'       # 批量删除
+
+class SyncEvent:
+    """同步事件类，包含操作信息"""
+    def __init__(self, operation, node=None, old_value=None, new_value=None, 
+                 metadata=None, relations=None, context=None):
+        self.operation = operation      # 操作类型
+        self.node = node               # 相关节点
+        self.old_value = old_value     # 旧值
+        self.new_value = new_value     # 新值
+        self.metadata = metadata       # 元数据
+        self.relations = relations     # 关系信息
+        self.context = context         # 上下文信息
+        self.timestamp = time.time()   # 时间戳
+        self.event_id = str(uuid.uuid4())  # 事件ID
+
+class ISyncHandler:
+    """同步处理器接口，用户需要实现这个接口"""
+    
+    def on_node_create(self, event: SyncEvent):
+        """节点创建时调用"""
+        pass
+    
+    def on_node_update(self, event: SyncEvent):
+        """节点更新时调用"""
+        pass
+    
+    def on_node_delete(self, event: SyncEvent):
+        """节点删除时调用"""
+        pass
+    
+    def on_relation_add(self, event: SyncEvent):
+        """关系添加时调用"""
+        pass
+    
+    def on_relation_remove(self, event: SyncEvent):
+        """关系移除时调用"""
+        pass
+    
+    def on_batch_operation(self, events: List[SyncEvent]):
+        """批量操作时调用"""
+        pass
+    
+    def on_transaction_commit(self, transaction_id: str, events: List[SyncEvent]):
+        """事务提交时调用"""
+        pass
+    
+    def on_transaction_rollback(self, transaction_id: str, events: List[SyncEvent]):
+        """事务回滚时调用"""
+        pass
+
+class LinkedListSyncHandler(ISyncHandler):
+    """链表同步处理器示例实现"""
+    
+    def __init__(self):
+        self.linked_list = []
+        self.node_positions = {}  # 节点键 -> 位置映射
+        self.lock = threading.RLock()
+    
+    def on_node_create(self, event: SyncEvent):
+        """将新节点添加到链表末尾"""
+        with self.lock:
+            node = event.node
+            self.linked_list.append(node)
+            self.node_positions[node.key] = len(self.linked_list) - 1
+            print(f"LinkedList: 添加节点 {node.key} 到位置 {len(self.linked_list) - 1}")
+    
+    def on_node_update(self, event: SyncEvent):
+        """更新链表中的节点"""
+        with self.lock:
+            node = event.node
+            if node.key in self.node_positions:
+                pos = self.node_positions[node.key]
+                self.linked_list[pos] = node
+                print(f"LinkedList: 更新位置 {pos} 的节点 {node.key}")
+    
+    def on_node_delete(self, event: SyncEvent):
+        """从链表中删除节点"""
+        with self.lock:
+            node = event.node
+            if node.key in self.node_positions:
+                pos = self.node_positions[node.key]
+                del self.linked_list[pos]
+                del self.node_positions[node.key]
+                
+                # 更新后续节点的位置映射
+                for i in range(pos, len(self.linked_list)):
+                    node_at_pos = self.linked_list[i]
+                    self.node_positions[node_at_pos.key] = i
+                
+                print(f"LinkedList: 删除节点 {node.key}")
+    
+    def get_ordered_nodes(self):
+        """获取按插入顺序排列的节点"""
+        with self.lock:
+            return self.linked_list.copy()
+    
+    def find_node_position(self, key):
+        """查找节点在链表中的位置"""
+        with self.lock:
+            return self.node_positions.get(key, -1)
+
+class TreeSyncHandler(ISyncHandler):
+    """树结构同步处理器示例实现"""
+    
+    def __init__(self):
+        self.tree = {}  # 父节点 -> 子节点列表
+        self.parent_map = {}  # 子节点 -> 父节点
+        self.lock = threading.RLock()
+    
+    def on_node_create(self, event: SyncEvent):
+        """将节点添加到树结构"""
+        with self.lock:
+            node = event.node
+            parent_key = event.context.get('parent_key') if event.context else None
+            
+            if parent_key:
+                # 添加为子节点
+                if parent_key not in self.tree:
+                    self.tree[parent_key] = []
+                self.tree[parent_key].append(node.key)
+                self.parent_map[node.key] = parent_key
+                print(f"Tree: 添加节点 {node.key} 作为 {parent_key} 的子节点")
+            else:
+                # 添加为根节点
+                if 'roots' not in self.tree:
+                    self.tree['roots'] = []
+                self.tree['roots'].append(node.key)
+                print(f"Tree: 添加根节点 {node.key}")
+    
+    def on_node_delete(self, event: SyncEvent):
+        """从树结构中删除节点"""
+        with self.lock:
+            node = event.node
+            key = node.key
+            
+            # 删除父子关系
+            if key in self.parent_map:
+                parent_key = self.parent_map[key]
+                if parent_key in self.tree:
+                    self.tree[parent_key].remove(key)
+                del self.parent_map[key]
+            elif 'roots' in self.tree and key in self.tree['roots']:
+                self.tree['roots'].remove(key)
+            
+            # 删除子节点关系
+            if key in self.tree:
+                del self.tree[key]
+            
+            print(f"Tree: 删除节点 {key}")
+    
+    def get_children(self, parent_key):
+        """获取指定节点的子节点"""
+        with self.lock:
+            return self.tree.get(parent_key, []).copy()
+    
+    def get_parent(self, child_key):
+        """获取指定节点的父节点"""
+        with self.lock:
+            return self.parent_map.get(child_key)
+    
+    def get_roots(self):
+        """获取所有根节点"""
+        with self.lock:
+            return self.tree.get('roots', []).copy()
+
+class GraphSyncHandler(ISyncHandler):
+    """图结构同步处理器示例实现"""
+    
+    def __init__(self):
+        self.adjacency_list = {}  # 邻接表表示
+        self.edge_weights = {}    # 边权重
+        self.lock = threading.RLock()
+    
+    def on_node_create(self, event: SyncEvent):
+        """添加节点到图"""
+        with self.lock:
+            node = event.node
+            if node.key not in self.adjacency_list:
+                self.adjacency_list[node.key] = set()
+                print(f"Graph: 添加节点 {node.key}")
+    
+    def on_node_delete(self, event: SyncEvent):
+        """从图中删除节点"""
+        with self.lock:
+            node = event.node
+            key = node.key
+            
+            # 删除所有相关的边
+            if key in self.adjacency_list:
+                # 删除出边
+                for neighbor in self.adjacency_list[key]:
+                    if neighbor in self.adjacency_list:
+                        self.adjacency_list[neighbor].discard(key)
+                    # 删除边权重
+                    edge_key = f"{key}-{neighbor}"
+                    self.edge_weights.pop(edge_key, None)
+                    edge_key = f"{neighbor}-{key}"
+                    self.edge_weights.pop(edge_key, None)
+                
+                del self.adjacency_list[key]
+                print(f"Graph: 删除节点 {key}")
+    
+    def on_relation_add(self, event: SyncEvent):
+        """添加边到图"""
+        with self.lock:
+            relations = event.relations
+            if relations:
+                source_key = relations.get('source')
+                target_key = relations.get('target')
+                weight = relations.get('weight', 1.0)
+                
+                if source_key and target_key:
+                    # 确保节点存在
+                    if source_key not in self.adjacency_list:
+                        self.adjacency_list[source_key] = set()
+                    if target_key not in self.adjacency_list:
+                        self.adjacency_list[target_key] = set()
+                    
+                    # 添加边
+                    self.adjacency_list[source_key].add(target_key)
+                    edge_key = f"{source_key}-{target_key}"
+                    self.edge_weights[edge_key] = weight
+                    
+                    print(f"Graph: 添加边 {source_key} -> {target_key} (权重: {weight})")
+    
+    def on_relation_remove(self, event: SyncEvent):
+        """从图中删除边"""
+        with self.lock:
+            relations = event.relations
+            if relations:
+                source_key = relations.get('source')
+                target_key = relations.get('target')
+                
+                if source_key and target_key:
+                    if source_key in self.adjacency_list:
+                        self.adjacency_list[source_key].discard(target_key)
+                    
+                    edge_key = f"{source_key}-{target_key}"
+                    self.edge_weights.pop(edge_key, None)
+                    
+                    print(f"Graph: 删除边 {source_key} -> {target_key}")
+    
+    def get_neighbors(self, node_key):
+        """获取节点的邻居"""
+        with self.lock:
+            return list(self.adjacency_list.get(node_key, set()))
+    
+    def get_edge_weight(self, source, target):
+        """获取边的权重"""
+        with self.lock:
+            edge_key = f"{source}-{target}"
+            return self.edge_weights.get(edge_key, None)
+    
+    def get_all_edges(self):
+        """获取所有边"""
+        with self.lock:
+            edges = []
+            for source, targets in self.adjacency_list.items():
+                for target in targets:
+                    edge_key = f"{source}-{target}"
+                    weight = self.edge_weights.get(edge_key, 1.0)
+                    edges.append((source, target, weight))
+            return edges
+
+class SyncManager:
+    """同步管理器，管理所有同步处理器"""
+    
+    def __init__(self):
+        self.handlers = {}  # 处理器名称 -> 处理器实例
+        self.event_queue = deque()  # 事件队列
+        self.async_mode = False  # 是否异步处理
+        self.worker_thread = None
+        self.running = False
+        self.lock = threading.RLock()
+        self.batch_size = 100  # 批处理大小
+        self.batch_timeout = 1.0  # 批处理超时时间（秒）
+    
+    def register_handler(self, name: str, handler: ISyncHandler):
+        """注册同步处理器"""
+        with self.lock:
+            self.handlers[name] = handler
+            print(f"SyncManager: 注册处理器 '{name}'")
+    
+    def unregister_handler(self, name: str):
+        """注销同步处理器"""
+        with self.lock:
+            if name in self.handlers:
+                del self.handlers[name]
+                print(f"SyncManager: 注销处理器 '{name}'")
+    
+    def get_handler(self, name: str) -> ISyncHandler:
+        """获取指定的同步处理器"""
+        with self.lock:
+            return self.handlers.get(name)
+    
+    def list_handlers(self) -> List[str]:
+        """列出所有注册的处理器名称"""
+        with self.lock:
+            return list(self.handlers.keys())
+    
+    def set_async_mode(self, async_mode: bool):
+        """设置是否异步处理事件"""
+        with self.lock:
+            self.async_mode = async_mode
+            if async_mode and not self.running:
+                self.start_async_processing()
+            elif not async_mode and self.running:
+                self.stop_async_processing()
+    
+    def start_async_processing(self):
+        """启动异步事件处理"""
+        if not self.running:
+            self.running = True
+            self.worker_thread = threading.Thread(target=self._process_events_async, daemon=True)
+            self.worker_thread.start()
+            print("SyncManager: 启动异步事件处理")
+    
+    def stop_async_processing(self):
+        """停止异步事件处理"""
+        if self.running:
+            self.running = False
+            if self.worker_thread:
+                self.worker_thread.join(timeout=5.0)
+            print("SyncManager: 停止异步事件处理")
+    
+    def trigger_event(self, event: SyncEvent):
+        """触发同步事件"""
+        if self.async_mode:
+            with self.lock:
+                self.event_queue.append(event)
+        else:
+            self._process_event_sync(event)
+    
+    def trigger_batch_events(self, events: List[SyncEvent]):
+        """触发批量同步事件"""
+        if self.async_mode:
+            with self.lock:
+                self.event_queue.extend(events)
+        else:
+            self._process_batch_events_sync(events)
+    
+    def _process_event_sync(self, event: SyncEvent):
+        """同步处理单个事件"""
+        with self.lock:
+            for name, handler in self.handlers.items():
+                try:
+                    if event.operation == SyncOperation.CREATE:
+                        handler.on_node_create(event)
+                    elif event.operation == SyncOperation.UPDATE:
+                        handler.on_node_update(event)
+                    elif event.operation == SyncOperation.DELETE:
+                        handler.on_node_delete(event)
+                    elif event.operation == SyncOperation.ADD_RELATION:
+                        handler.on_relation_add(event)
+                    elif event.operation == SyncOperation.REMOVE_RELATION:
+                        handler.on_relation_remove(event)
+                except Exception as e:
+                    print(f"SyncManager: 处理器 '{name}' 处理事件时出错: {e}")
+    
+    def _process_batch_events_sync(self, events: List[SyncEvent]):
+        """同步处理批量事件"""
+        with self.lock:
+            for name, handler in self.handlers.items():
+                try:
+                    handler.on_batch_operation(events)
+                    # 也逐个处理事件
+                    for event in events:
+                        self._process_single_handler_event(handler, event)
+                except Exception as e:
+                    print(f"SyncManager: 处理器 '{name}' 处理批量事件时出错: {e}")
+    
+    def _process_single_handler_event(self, handler: ISyncHandler, event: SyncEvent):
+        """为单个处理器处理单个事件"""
+        try:
+            if event.operation == SyncOperation.CREATE:
+                handler.on_node_create(event)
+            elif event.operation == SyncOperation.UPDATE:
+                handler.on_node_update(event)
+            elif event.operation == SyncOperation.DELETE:
+                handler.on_node_delete(event)
+            elif event.operation == SyncOperation.ADD_RELATION:
+                handler.on_relation_add(event)
+            elif event.operation == SyncOperation.REMOVE_RELATION:
+                handler.on_relation_remove(event)
+        except Exception as e:
+            print(f"SyncManager: 处理事件时出错: {e}")
+    
+    def _process_events_async(self):
+        """异步事件处理工作线程"""
+        batch = []
+        last_batch_time = time.time()
+        
+        while self.running:
+            try:
+                # 收集事件到批次
+                current_time = time.time()
+                
+                with self.lock:
+                    while self.event_queue and len(batch) < self.batch_size:
+                        batch.append(self.event_queue.popleft())
+                
+                # 检查是否需要处理批次
+                should_process = (
+                    len(batch) >= self.batch_size or
+                    (batch and current_time - last_batch_time >= self.batch_timeout)
+                )
+                
+                if should_process and batch:
+                    self._process_batch_events_sync(batch)
+                    batch.clear()
+                    last_batch_time = current_time
+                
+                # 短暂休眠
+                time.sleep(0.01)
+                
+            except Exception as e:
+                print(f"SyncManager: 异步处理线程出错: {e}")
+                time.sleep(0.1)
+    
+    def get_queue_size(self) -> int:
+        """获取事件队列大小"""
+        with self.lock:
+            return len(self.event_queue)
+    
+    def clear_queue(self):
+        """清空事件队列"""
+        with self.lock:
+            self.event_queue.clear()
+            print("SyncManager: 清空事件队列")
+
 # 事务状态枚举类
 class TransactionState(Enum):
     """事务状态枚举类"""
@@ -308,6 +749,70 @@ class LockManager:
             if resource_id in self.locks:
                 return dict(self.locks[resource_id])
             return {}
+    
+    def detect_all_deadlocks(self):
+        """
+        检测系统中所有的死锁
+        
+        返回:
+            list: 死锁事务循环列表
+        """
+        deadlocks = []
+        
+        with self.lock:
+            # 复制等待图以避免在检测过程中修改
+            wait_graph = {txn_id: set(waiting_for) 
+                        for txn_id, waiting_for in self.wait_for_graph.items()}
+            
+            # 检查所有事务
+            for txn_id in wait_graph:
+                cycle = self._find_deadlock_cycle(txn_id, wait_graph)
+                if cycle and cycle not in deadlocks:
+                    deadlocks.append(cycle)
+                    
+        return deadlocks
+    
+    def _find_deadlock_cycle(self, start_txn, wait_graph=None):
+        """
+        查找从指定事务开始的死锁循环
+        
+        参数:
+            start_txn: 起始事务ID
+            wait_graph: 等待图，如果为None则使用当前等待图
+            
+        返回:
+            list: 死锁循环的事务ID列表，如果没有死锁则返回None
+        """
+        if wait_graph is None:
+            wait_graph = self.wait_for_graph
+            
+        if start_txn not in wait_graph:
+            return None
+            
+        # 使用DFS查找循环
+        visited = set()
+        path = []
+        
+        def dfs(txn_id):
+            visited.add(txn_id)
+            path.append(txn_id)
+            
+            if txn_id in wait_graph:
+                for waiting_for in wait_graph[txn_id]:
+                    if waiting_for == start_txn:
+                        # 找到循环，返回完整路径
+                        return path + [start_txn]
+                    
+                    if waiting_for not in visited:
+                        result = dfs(waiting_for)
+                        if result:
+                            return result
+            
+            # 回溯
+            path.pop()
+            return None
+            
+        return dfs(start_txn)
 
 
 # 自定义异常类
@@ -475,7 +980,7 @@ class ION:
     
     class IONNode:
         """节点类，继承和扩展RNode的功能"""
-        def __init__(self, key, val, metadata=None, tags=None, weight=1.0):
+        def __init__(self, key, val, metadata=None, tags=None, weight=1.0, row=None):
             self._key = key
             self._val = val
             self._r = []  # 关系列表
@@ -486,6 +991,7 @@ class ION:
             self._updated_at = time.time()  # 更新时间
             self._ion_reference = None  # 引用所属的ION实例
             self._partition = None  # 数据分区标识
+            self._row = row  # 表行标识，用于表查找功能
             
             # 确保标签被正确处理
             if tags is not None:
@@ -621,7 +1127,21 @@ class ION:
                 if old_value is not None:
                     self._ion_reference._remove_metadata_index(key, old_value, self)
                 self._ion_reference._index_metadata(key, value, self)
+        
+        @property
+        def row(self):
+            """行标识属性访问器"""
+            return self._row
             
+        @row.setter
+        def row(self, new_row):
+            """行标识属性设置器"""
+            if self._ion_reference:
+                # 如果有ION引用，通过ION更新行标识
+                self._ion_reference.update_node_row(self, new_row)
+            else:
+                self._row = new_row
+        
         def __str__(self):
             return f"IONNode(key={self._key}, val={self._val}, relations={len(self._r)})"
 
@@ -646,7 +1166,12 @@ class ION:
                 node_pool_enabled=True,            # 启用节点对象池
                 node_reuse_threshold=0.5,          # 节点重用阈值
                 value_compression=False,           # 值压缩
-                async_indexing=False):             # 异步索引更新
+                async_indexing=False,              # 异步索引更新
+                # 同步系统选项
+                enable_sync=True,                  # 启用同步系统
+                sync_async_mode=False,             # 同步系统异步模式
+                sync_batch_size=100,               # 同步批处理大小
+                sync_batch_timeout=1.0):           # 同步批处理超时时间
         """初始化ION实例，添加优化参数支持，特别针对大型数据集(10万+)
         
         参数:
@@ -801,6 +1326,34 @@ class ION:
         self.auto_optimize = auto_optimize
         
         # 针对大数据集的优化选项
+        self.partition_config = partition_config
+        self.parallel_query = parallel_query
+        self.index_compression = index_compression
+        self.large_dataset_mode = large_dataset_mode
+        self.max_partition_size = max_partition_size
+        self.dynamic_partition = dynamic_partition
+        
+        # 性能优化增强选项
+        self.query_cache_enabled = query_cache_enabled
+        self.query_cache_size = query_cache_size
+        self.batch_buffer_size = batch_buffer_size
+        self.node_pool_enabled = node_pool_enabled
+        self.node_reuse_threshold = node_reuse_threshold
+        self.value_compression = value_compression
+        self.async_indexing = async_indexing
+        
+        # 同步系统初始化
+        self.enable_sync = enable_sync
+        if enable_sync:
+            self.sync_manager = SyncManager()
+            self.sync_manager.set_async_mode(sync_async_mode)
+            self.sync_batch_size = sync_batch_size
+            self.sync_batch_timeout = sync_batch_timeout
+            
+            # 注册内置的同步处理器示例（用户可以选择使用）
+            self._register_builtin_sync_handlers()
+        else:
+            self.sync_manager = None
         self.partition_config = partition_config or {"strategy": "hash", "field": None}
         self.parallel_query = parallel_query
         self.index_compression = index_compression
@@ -890,6 +1443,123 @@ class ION:
         # 创建初始分区结构
         if self.partition_config["strategy"] != "hash" and self.partition_config["field"] is not None:
             self._initialize_partitions()
+        
+        # 表查找功能初始化
+        self.row_index = {}  # 行索引: row_id -> [节点列表]
+        self.table_index = {}  # 表索引: table_name -> {row_id: 节点}
+        self.row_index_lock = threading.RLock()  # 行索引锁
+        self.table_index_lock = threading.RLock()  # 表索引锁
+    
+    def _register_builtin_sync_handlers(self):
+        """注册内置的同步处理器示例"""
+        if not self.sync_manager:
+            return
+            
+        # 用户可以选择性地启用这些处理器
+        # 这里只是注册，不自动启用
+        pass  # 用户需要手动注册他们需要的处理器
+    
+    def register_sync_handler(self, name: str, handler: ISyncHandler):
+        """注册自定义同步处理器
+        
+        Args:
+            name: 处理器名称
+            handler: 实现了ISyncHandler接口的处理器实例
+        """
+        if self.sync_manager:
+            self.sync_manager.register_handler(name, handler)
+        else:
+            raise RuntimeError("同步系统未启用，请在初始化时设置 enable_sync=True")
+    
+    def unregister_sync_handler(self, name: str):
+        """注销同步处理器
+        
+        Args:
+            name: 处理器名称
+        """
+        if self.sync_manager:
+            self.sync_manager.unregister_handler(name)
+    
+    def get_sync_handler(self, name: str) -> ISyncHandler:
+        """获取指定的同步处理器
+        
+        Args:
+            name: 处理器名称
+            
+        Returns:
+            ISyncHandler: 处理器实例，如果不存在返回None
+        """
+        if self.sync_manager:
+            return self.sync_manager.get_handler(name)
+        return None
+    
+    def list_sync_handlers(self) -> List[str]:
+        """列出所有注册的同步处理器名称
+        
+        Returns:
+            List[str]: 处理器名称列表
+        """
+        if self.sync_manager:
+            return self.sync_manager.list_handlers()
+        return []
+    
+    def set_sync_async_mode(self, async_mode: bool):
+        """设置同步系统的异步模式
+        
+        Args:
+            async_mode: 是否启用异步模式
+        """
+        if self.sync_manager:
+            self.sync_manager.set_async_mode(async_mode)
+    
+    def get_sync_queue_size(self) -> int:
+        """获取同步事件队列大小
+        
+        Returns:
+            int: 队列中待处理的事件数量
+        """
+        if self.sync_manager:
+            return self.sync_manager.get_queue_size()
+        return 0
+    
+    def clear_sync_queue(self):
+        """清空同步事件队列"""
+        if self.sync_manager:
+            self.sync_manager.clear_queue()
+    
+    def _trigger_sync_event(self, operation: SyncOperation, node=None, old_value=None, 
+                           new_value=None, metadata=None, relations=None, context=None):
+        """触发同步事件
+        
+        Args:
+            operation: 操作类型
+            node: 相关节点
+            old_value: 旧值
+            new_value: 新值
+            metadata: 元数据
+            relations: 关系信息
+            context: 上下文信息
+        """
+        if self.sync_manager:
+            event = SyncEvent(
+                operation=operation,
+                node=node,
+                old_value=old_value,
+                new_value=new_value,
+                metadata=metadata,
+                relations=relations,
+                context=context
+            )
+            self.sync_manager.trigger_event(event)
+    
+    def _trigger_sync_batch_events(self, events: List[SyncEvent]):
+        """触发批量同步事件
+        
+        Args:
+            events: 事件列表
+        """
+        if self.sync_manager and events:
+            self.sync_manager.trigger_batch_events(events)
     
     def _initialize_partitions(self):
         """根据分区策略初始化分区结构"""
@@ -1881,7 +2551,7 @@ class ION:
         """获取当前负载因子"""
         return self.count / self.size if self.size > 0 else 1.0
     
-    def create_node(self, key, val=None, metadata=None, tags=None, weight=1.0):
+    def create_node(self, key, val=None, metadata=None, tags=None, weight=1.0, row=None):
         """创建新节点或更新现有节点，支持自动分区
         
         Args:
@@ -1890,6 +2560,7 @@ class ION:
             metadata: 节点元数据字典
             tags: 节点标签列表
             weight: 节点权重
+            row: 表行标识，用于表查找功能
             
         Returns:
             Node: 创建或更新的节点
@@ -1928,7 +2599,7 @@ class ION:
         # 3. 创建新节点
         with self.lock:
             # 创建新的IONNode实例
-            new_node = self.node_class(key, val, metadata, tags, weight)
+            new_node = self.node_class(key, val, metadata, tags, weight, row)
             
             # 计算键的哈希值并确定存储桶
             bucket_index = self.hf(key)  # 使用类的哈希函数计算索引
@@ -1992,8 +2663,16 @@ class ION:
                 # 索引值类型
                 self._index_value_type(new_node.val, new_node)
                 
+                # 索引行标识
+                if new_node.row is not None:
+                    self._index_row(new_node.row, new_node)
+                
                 # 触发事件回调
                 self._trigger_event('node_added', node=new_node)
+                
+                # 触发同步事件
+                self._trigger_sync_event(SyncOperation.CREATE, node=new_node, new_value=val, 
+                                        metadata=metadata, context={'key': key, 'partition': partition_name})
                 
                 # 检查是否需要扩容
                 if self.count > self.size * self.load_factor_threshold:
@@ -2123,6 +2802,11 @@ class ION:
                     self._combined_data.delete(key, keep_relationships=False)
                     
                     self._trigger_event('node_removed', node=removed)
+                    
+                    # 触发同步事件
+                    self._trigger_sync_event(SyncOperation.DELETE, node=removed, old_value=removed.val, 
+                                            context={'key': key})
+                    
                     return removed
         return None
     
@@ -2146,6 +2830,10 @@ class ION:
             self.value_type_index[value_type].remove(node)
             if not self.value_type_index[value_type]:
                 del self.value_type_index[value_type]
+        
+        # 清理行索引
+        if node.row is not None:
+            self._remove_row_index(node.row, node)
     
     def _index_metadata(self, meta_key, meta_val, node):
         """为元数据创建索引"""
@@ -2265,6 +2953,11 @@ class ION:
         self._combined_data.put(key, new_val, metadata=node.metadata)
         
         self._trigger_event('node_updated', node=node, old_val=old_val)
+        
+        # 触发同步事件
+        self._trigger_sync_event(SyncOperation.UPDATE, node=node, old_value=old_val, 
+                               new_value=new_val, context={'key': key, 'update_type': 'value'})
+        
         return node
     
     def update_node_metadata(self, node, new_metadata):
@@ -2386,6 +3079,14 @@ class ION:
                                source=source_node, 
                                target=target_node, 
                                rel_type=rel_type)
+            
+            # 触发同步事件
+            self._trigger_sync_event(SyncOperation.ADD_RELATION, 
+                                   node=source_node,
+                                   relations={'target': target_node, 'type': rel_type, 'weight': rel_weight},
+                                   metadata=metadata,
+                                   context={'source_key': source_node.key, 'target_key': target_node.key})
+            
             return True
         return False
     
@@ -2436,6 +3137,13 @@ class ION:
                                       source=source_node, 
                                       target=target_node, 
                                       rel_type=removed_type)
+                    
+                    # 触发同步事件
+                    self._trigger_sync_event(SyncOperation.REMOVE_RELATION,
+                                           node=source_node,
+                                           relations={'target': target_node, 'type': removed_type},
+                                           context={'source_key': source_node.key, 'target_key': target_node.key})
+                    
                     return True
         return False
     
@@ -2922,7 +3630,7 @@ class ION:
                     
                 # 创建新实例
                 ion = cls(size=data.get('size', 1024), 
-                         max_workers=max_workers, 
+                max_workers=max_workers,
                          load_factor_threshold=data.get('load_factor_threshold', 0.75))
                          
                 # 使用_prepare_serialization格式的数据加载
@@ -3637,7 +4345,7 @@ class ION:
                 print(f"更新节点 {node} 的标签时出错: {e}")
                 return None
                 
-        return self.parallel_batch_process(node_list, update_tags)
+            return self.parallel_batch_process(node_list, update_tags)
         
     def batch_update_weights(self, nodes_weights):
         """
@@ -4165,7 +4873,7 @@ class ION:
                         best_meeting_point = current
                         best_cost = path_cost
                 
-                # 如果当前节点已访问过，跳过
+                # 如果当前节点已经被访问过，跳过
                 if current in closed_set_fwd:
                     continue
                 
@@ -4602,8 +5310,8 @@ class ION:
         
         参数:
             txn_id: 事务ID
-            key: 节点键
-            val: 节点值
+             key: 节点键
+             val: 节点值
             metadata: 元数据
             tags: 标签
             weight: 权重
@@ -4620,7 +5328,7 @@ class ION:
             # 为节点键获取排他锁
             self.acquire_write_lock(txn_id, key, transaction.timeout)
             
-        # 创建节点
+                    # 创建节点
         node = self.create_node(key, val, metadata, tags, weight)
         
         # 记录日志
@@ -5927,8 +6635,8 @@ class ION:
     def _build_compound_index(self, index_types):
         """为所有现有节点构建指定的复合索引"""
         for bucket in self.buckets:
-            for node in bucket:
-                self._index_node_to_compound(node, index_types)
+                for node in bucket:
+                    self._index_node_to_compound(node, index_types)
     def _async_indexing_worker(self):
         """异步索引更新工作线程，处理索引队列中的操作"""
         while self.async_indexing:
@@ -5954,23 +6662,23 @@ class ION:
                 if op_type == 'add':
                     # 添加节点到索引
                     if node:
-                        # 添加到双向映射
+                    # 添加到双向映射
                         self.bimap.add(node.key, node.val)
                         
                         # 添加到组合数据结构
                         self._combined_data.put(node.key, node.val, metadata=node.metadata)
-                        
-                        # 索引元数据
-                        if node.metadata:
-                            for m_key, m_val in node.metadata.items():
+                    
+                    # 索引元数据
+                    if node.metadata:
+                        for m_key, m_val in node.metadata.items():
                                 self._index_metadata(m_key, m_val, node)
-                        
-                        # 索引标签
-                        if node.tags:
-                            for tag in node.tags:
+                    
+                    # 索引标签
+                    if node.tags:
+                        for tag in node.tags:
                                 self._index_tag(tag, node)
-                                
-                        # 索引值类型
+                         
+                 # 索引值类型
                         self._index_value_type(node.val, node)
                         
                         # 添加到复合索引
@@ -6213,121 +6921,7 @@ class ION:
         return list(result)
         
     # 在创建和更新节点方法中添加对复合索引的支持
-    def create_node(self, key, val, metadata=None, tags=None, weight=1.0):
-        """创建新节点或更新现有节点"""
-        # 检查是否需要扩容
-        self._check_resize()
-        
-        # 处理标签参数 - 确保字符串类型的标签被视为单个标签而不是字符序列
-        if tags is not None and isinstance(tags, str):
-            tags = [tags]  # 将字符串转换为单元素列表
-        
-        index = self.hf(key)
-        with self.bucket_locks[index]:
-            nodes = self.buckets[index]
-            for node in nodes:
-                if node.key == key:
-                    # 节点已存在，更新
-                    old_val = node.val
-                    node.val = val
-                    
-                    if metadata:
-                        self.update_node_metadata(node, metadata)
-                    
-                    if tags:
-                        for tag in tags:
-                            node.add_tag(tag)
-                            
-                    if weight != 1.0:
-                        node.weight = weight
-                        
-                    self._trigger_event('node_updated', node=node, old_val=old_val)
-                    return node
-            
-            # 创建新节点
-            new_node = self.node_class(key, val, metadata, tags, weight)
-            new_node._ion_reference = self  # 设置ION引用
-            nodes.append(new_node)
-            self.count += 1
-            
-            # 更新各种索引
-            self.bimap.add(key, val)
-            
-            # 添加到组合数据结构
-            self._combined_data.put(key, val, metadata=metadata)
-            
-            # 索引元数据
-            if metadata:
-                for m_key, m_val in metadata.items():
-                    self._index_metadata(m_key, m_val, new_node)
-            
-            # 索引标签
-            if tags:
-                for tag in tags:
-                    self._index_tag(tag, new_node)
-            
-            # 索引值类型
-            self._index_value_type(val, new_node)
-            
-            self._trigger_event('node_added', node=new_node)
-            
-            # 添加到所有复合索引
-            for index_types in self.compound_index_types:
-                self._index_node_to_compound(new_node, index_types)
-            
-            return new_node
     
-    def update_node_metadata(self, node, new_metadata):
-        """更新节点的元数据并同步索引"""
-        # 从复合索引中删除节点
-        self._remove_node_from_compound_indices(node)
-        
-        # 调用原方法更新元数据
-        result = self.update_node_metadata_base(node, new_metadata)
-        
-        # 重新添加到复合索引
-        for index_types in self.compound_index_types:
-            self._index_node_to_compound(node, index_types)
-            
-        return result
-    
-    def update_node_tag(self, node, operation='add', tags=None, clear_existing=False):
-        """更新节点的标签"""
-        # 从复合索引中删除节点
-        self._remove_node_from_compound_indices(node)
-        
-        # 调用原方法更新标签
-        result = self.update_node_tag_base(node, operation, tags, clear_existing)
-        
-        # 重新添加到复合索引
-        for index_types in self.compound_index_types:
-            self._index_node_to_compound(node, index_types)
-            
-        return result
-    
-    def update_node_weight(self, node, weight):
-        """更新节点的权重"""
-        # 从复合索引中删除节点
-        self._remove_node_from_compound_indices(node)
-        
-        # 调用原方法更新权重
-        result = self.update_node_weight_base(node, weight)
-        
-        # 重新添加到复合索引
-        for index_types in self.compound_index_types:
-            self._index_node_to_compound(node, index_types)
-            
-        return result
-    
-    def remove_node_by_key(self, key):
-        """通过键删除节点"""
-        node = self.get_node_by_key(key)
-        if node:
-            # 从复合索引中删除节点
-            self._remove_node_from_compound_indices(node)
-            
-        # 调用原方法删除节点
-        return self.remove_node_by_key_base(key)
     
     # 批量索引更新方法
     def _schedule_index_update(self, update_type, node, data=None):
@@ -6420,158 +7014,7 @@ class ION:
         # 这个方法用于批量处理索引更新，但在这里我们暂时不需要实现具体的批处理逻辑
         pass
         
-    def _cleanup_node_indices(self, node):
-        """清理被删除节点的所有索引"""
-        # 清理双向映射
-        self.bimap.remove(node.key)
-        
-        # 清理元数据索引
-        if node.metadata:
-            for m_key, m_val in node.metadata.items():
-                self._remove_metadata_index(m_key, m_val, node)
-        
-        # 清理标签索引
-        if hasattr(node, 'tags') and node.tags:
-            for tag in node.tags:
-                self._remove_tag_index(tag, node)
-        
-        # 清理值类型索引
-        value_type = type(node.val).__name__
-        if value_type in self.value_type_index and node in self.value_type_index[value_type]:
-            self.value_type_index[value_type].remove(node)
-            if not self.value_type_index[value_type]:
-                del self.value_type_index[value_type]
     
-    # 增强并发控制的锁粒度调整
-    def find_by_metadata(self, meta_key, meta_val):
-        """通过元数据查找节点，添加锁保护"""
-        key = f"{meta_key}:{meta_val}"
-        with self.metadata_index_lock:
-            return self.metadata_index.get(key, []).copy()  # 返回副本以避免并发修改
-    
-    def find_by_tag(self, tag):
-        """通过标签查找节点，添加锁保护"""
-        with self.tag_index_lock:
-            return self.tag_index.get(tag, []).copy()  # 返回副本以避免并发修改
-    
-    def find_by_value_type(self, type_name):
-        """通过值的类型查找节点，添加锁保护"""
-        with self.value_type_index_lock:
-            return self.value_type_index.get(type_name, []).copy()  # 返回副本以避免并发修改
-    
-    # 添加更多的锁粒度调整方法
-    def get_relation_locks(self, source_key, target_key):
-        """获取关系操作所需的锁，实现更细粒度的锁控制"""
-        # 获取源节点和目标节点所在的桶
-        source_index = self.hf(source_key)
-        target_index = self.hf(target_key)
-        
-        if source_index == target_index:
-            # 如果在同一个桶中，只需要获取一个锁
-            return [self.bucket_locks[source_index]]
-        else:
-            # 如果在不同桶中，需要获取两个锁，并按索引顺序获取避免死锁
-            if source_index < target_index:
-                return [self.bucket_locks[source_index], self.bucket_locks[target_index]]
-            else:
-                return [self.bucket_locks[target_index], self.bucket_locks[source_index]]
-    
-    def add_relationship(self, source, target, rel_type=None, rel_weight=1.0, metadata=None):
-        """添加关系 (支持多种输入类型)，使用更细粒度的锁"""
-        source_node = self._get_node_from_input(source)
-        target_node = self._get_node_from_input(target)
-        
-        if not source_node or not target_node:
-            return False
-            
-        # 获取源节点和目标节点的锁
-        locks = self.get_relation_locks(source_node.key, target_node.key)
-        
-        # 按顺序获取所有锁
-        for lock in locks:
-            lock.acquire()
-            
-        try:
-            source_node.add_relation(target_node, rel_type, rel_weight, metadata)
-            
-            # 更新关系类型索引
-            if rel_type:
-                with self.relation_type_index_lock:
-                    if rel_type not in self.relation_type_index:
-                        self.relation_type_index[rel_type] = []
-                    if source_node not in self.relation_type_index[rel_type]:
-                        self.relation_type_index[rel_type].append(source_node)
-            
-            # 更新组合数据结构
-            self._combined_data.add_relationship(source_node.key, target_node.key)
-            if metadata:
-                self._combined_data.add_relationship_with_metadata(
-                    source_node.key, target_node.key, metadata)
-            
-            self._trigger_event('relation_added', 
-                              source=source_node, 
-                              target=target_node, 
-                              rel_type=rel_type)
-            return True
-        finally:
-            # 按相反顺序释放所有锁
-            for lock in reversed(locks):
-                lock.release()
-        
-        return False
-    
-    def remove_relationship(self, source, target, rel_type=None):
-        """移除两个节点间的关系，使用更细粒度的锁"""
-        source_node = self._get_node_from_input(source)
-        target_node = self._get_node_from_input(target)
-        
-        if not source_node or not target_node:
-            return False
-            
-        # 获取源节点和目标节点的锁
-        locks = self.get_relation_locks(source_node.key, target_node.key)
-        
-        # 按顺序获取所有锁
-        for lock in locks:
-            lock.acquire()
-            
-        try:
-            # 查找关系
-            for i, rel in enumerate(source_node.r):
-                if rel['node'] == target_node and (rel_type is None or rel['type'] == rel_type):
-                    removed_rel = source_node.r.pop(i)
-                    
-                    # 更新关系类型索引
-                    removed_type = removed_rel.get('type')
-                    if removed_type:
-                        with self.relation_type_index_lock:
-                            if removed_type in self.relation_type_index:
-                                # 检查节点是否还有其他相同类型的关系
-                                has_same_type = False
-                                for other_rel in source_node.r:
-                                    if other_rel.get('type') == removed_type:
-                                        has_same_type = True
-                                        break
-                                
-                                if not has_same_type and source_node in self.relation_type_index[removed_type]:
-                                    self.relation_type_index[removed_type].remove(source_node)
-                                    if not self.relation_type_index[removed_type]:
-                                        del self.relation_type_index[removed_type]
-                    
-                    # 从组合数据结构中移除关系
-                    self._combined_data.remove_relationship(source_node.key, target_node.key)
-                    
-                    self._trigger_event('relation_removed', 
-                                      source=source_node, 
-                                      target=target_node, 
-                                      rel_type=removed_type)
-                    return True
-            
-            return False
-        finally:
-            # 按相反顺序释放所有锁
-            for lock in reversed(locks):
-                lock.release()
     
     # 改进死锁检测和处理
     def optimize_deadlock_detection(self):
@@ -6613,80 +7056,6 @@ class ION:
         return detector_thread
     
     # 在事务管理器中添加死锁检测方法
-    def _check_transaction_conflicts(self, transaction):
-        """检查事务冲突，增强版本"""
-        # 原有检查代码 ...
-        
-        # 额外进行死锁检测
-        if transaction.id in self.lock_manager.wait_for_graph:
-            cycle = self.lock_manager._find_deadlock_cycle(transaction.id)
-            if cycle:
-                raise DeadlockError(f"事务 {transaction.id} 处于死锁状态: {cycle}")
-    
-    # 为LockManager类添加全面的死锁检测方法
-    def detect_all_deadlocks(self):
-        """
-        检测系统中所有的死锁
-        
-        返回:
-            list: 死锁事务循环列表
-        """
-        deadlocks = []
-        
-        with self.lock:
-            # 复制等待图以避免在检测过程中修改
-            wait_graph = {txn_id: set(waiting_for) 
-                        for txn_id, waiting_for in self.wait_for_graph.items()}
-            
-            # 检查所有事务
-            for txn_id in wait_graph:
-                cycle = self._find_deadlock_cycle(txn_id, wait_graph)
-                if cycle and cycle not in deadlocks:
-                    deadlocks.append(cycle)
-                    
-        return deadlocks
-    
-    def _find_deadlock_cycle(self, start_txn, wait_graph=None):
-        """
-        查找从指定事务开始的死锁循环
-        
-        参数:
-            start_txn: 起始事务ID
-            wait_graph: 等待图，如果为None则使用当前等待图
-            
-        返回:
-            list: 死锁循环的事务ID列表，如果没有死锁则返回None
-        """
-        if wait_graph is None:
-            wait_graph = self.wait_for_graph
-            
-        if start_txn not in wait_graph:
-            return None
-            
-        # 使用DFS查找循环
-        visited = set()
-        path = []
-        
-        def dfs(txn_id):
-            visited.add(txn_id)
-            path.append(txn_id)
-            
-            if txn_id in wait_graph:
-                for waiting_for in wait_graph[txn_id]:
-                    if waiting_for == start_txn:
-                        # 找到循环，返回完整路径
-                        return path + [start_txn]
-                    
-                    if waiting_for not in visited:
-                        result = dfs(waiting_for)
-                        if result:
-                            return result
-            
-            # 回溯
-            path.pop()
-            return None
-            
-        return dfs(start_txn)
 
     def find_nodes_by_metadata(self, metadata_key, metadata_value=None):
         """通过元数据查找节点，支持分区优化查询
@@ -6868,8 +7237,8 @@ class ION:
                                 if self.partition_config["strategy"] == "field":
                                     new_partition = self.create_dynamic_partition(field_value)
                                     self.assign_node_to_partition(node, new_partition)
-                        
-            return True
+        
+        return True
 
     # 基础方法实现
     def _schedule_resize(self):
@@ -6894,7 +7263,7 @@ class ION:
                     
                     self._trigger_event('node_removed', node=removed)
                     return removed
-        return None
+            return None
     # 添加被引用但缺失的基础方法
     def update_node_metadata_base(self, node, new_metadata):
         """更新节点的元数据并同步索引的基础实现"""
@@ -7004,5 +7373,327 @@ class ION:
         self._trigger_event('node_updated', node=node, old_weight=old_weight)
         
         return node
-        
+    # ==================== 表查找功能 ====================
     
+
+        # ==================== 表查找功能 ====================
+
+    def _normalize_row_id(self, row_id):
+        """将行标识转换为可哈希对象，避免 'unhashable type' 错误"""
+        if isinstance(row_id, (list, set)):
+            return tuple(row_id)
+        if isinstance(row_id, dict):
+            # 按键排序后转为元组，保证稳定性
+            return tuple(sorted(row_id.items()))
+        return row_id
+
+    # ---------- 行索引 ----------
+
+    def _index_row(self, row_id, node):
+        """为节点建立行索引"""
+        if row_id is None:
+            return
+        row_id = self._normalize_row_id(row_id)
+
+        with self.row_index_lock:
+            self.row_index.setdefault(row_id, [])
+            if node not in self.row_index[row_id]:
+                self.row_index[row_id].append(node)
+
+    def _remove_row_index(self, row_id, node):
+        """移除节点的行索引"""
+        if row_id is None:
+            return
+        row_id = self._normalize_row_id(row_id)
+
+        with self.row_index_lock:
+            bucket = self.row_index.get(row_id)
+            if bucket and node in bucket:
+                bucket.remove(node)
+                if not bucket:
+                    del self.row_index[row_id]
+
+    def update_node_row(self, node, new_row):
+        """更新节点的行标识并同步索引"""
+        old_row = node._row
+        norm_old = self._normalize_row_id(old_row) if old_row is not None else None
+        norm_new = self._normalize_row_id(new_row) if new_row is not None else None
+
+        if norm_old is not None:
+            self._remove_row_index(norm_old, node)
+
+        node._row = norm_new
+
+        if norm_new is not None:
+            self._index_row(norm_new, node)
+
+        if self.enable_sync:
+            self._trigger_sync_event(
+                SyncOperation.UPDATE,
+                node=node,
+                old_value=old_row,
+                new_value=norm_new,
+                context={'field': 'row'}
+            )
+        return node
+
+    def find_nodes_by_row(self, row_id):
+        """根据行标识查找节点"""
+        if row_id is None:
+            return []
+        row_id = self._normalize_row_id(row_id)
+
+        with self.row_index_lock:
+            return list(self.row_index.get(row_id, []))
+
+    # ---------- 表视图 ----------
+
+    def create_table_view(self, table_name, row_column_mapping):
+        """
+        创建表视图
+        Args:
+            table_name: 表名
+            row_column_mapping: {row_id: {column: node_key}}
+        """
+        with self.table_index_lock:
+            self.table_index.setdefault(table_name, {})
+            for row_id, columns in row_column_mapping.items():
+                tbl_row = self.table_index[table_name].setdefault(row_id, {})
+                for col, key in columns.items():
+                    node = self.get_node_by_key(key)
+                    if node:
+                        self.update_node_row(node, row_id)
+                        tbl_row[col] = node
+
+    def get_table_row(self, table_name, row_id):
+        """获取指定行"""
+        with self.table_index_lock:
+            return self.table_index.get(table_name, {}).get(row_id, {})
+
+    def get_table_column(self, table_name, column_name):
+        """获取整列"""
+        col_data = []
+        with self.table_index_lock:
+            for row_id, row in self.table_index.get(table_name, {}).items():
+                if column_name in row:
+                    col_data.append({'row_id': row_id, 'node': row[column_name]})
+        return col_data
+
+    def query_table(self, table_name, conditions=None, columns=None, limit=None):
+        """
+        通用查询
+        conditions 可为 dict 或可调用对象；columns=None 返回整行
+        """
+        results = []
+        with self.table_index_lock:
+            tbl = self.table_index.get(table_name, {})
+            for row_id, row in tbl.items():
+                match = True
+                if conditions:
+                    if callable(conditions):
+                        match = conditions(row)
+                    elif isinstance(conditions, dict):
+                        for c, v in conditions.items():
+                            if c not in row or row[c].val != v:
+                                match = False
+                                break
+                if not match:
+                    continue
+
+                res_row = {'row_id': row_id}
+                if columns:
+                    for col in columns:
+                        if col in row:
+                            res_row[col] = row[col]
+                else:
+                    res_row.update(row)
+                results.append(res_row)
+
+                if limit and len(results) >= limit:
+                    break
+        return results
+
+    def batch_create_table_nodes(self, table_data, table_name=None):
+        """
+        批量创建节点并可自动生成表视图
+        table_data: [{'row': row_id, 'columns': {col: val}}]
+        """
+        created, mapping = [], {}
+        for item in table_data:
+            row_id, cols = item.get('row'), item.get('columns', {})
+            if table_name:
+                mapping.setdefault(row_id, {})
+            for col, val in cols.items():
+                key = f"{table_name}_{row_id}_{col}" if table_name else f"{row_id}_{col}"
+                node = self.create_node(key=key, val=val,
+                                        metadata={'table': table_name, 'column': col},
+                                        row=row_id)
+                created.append(node)
+                if table_name:
+                    mapping[row_id][col] = key
+        if table_name and mapping:
+            self.create_table_view(table_name, mapping)
+        return created
+
+    def get_table_stats(self, table_name=None):
+        """返回单表或全部表统计信息"""
+        if table_name:
+            with self.table_index_lock:
+                tbl = self.table_index.get(table_name)
+                if not tbl:
+                    return None
+                return {
+                    'table_name': table_name,
+                    'row_count': len(tbl),
+                    'columns': set(col for row in tbl.values() for col in row),
+                    'total_cells': sum(len(r) for r in tbl.values())
+                }
+        stats = {}
+        with self.table_index_lock:
+            for name in self.table_index:
+                stats[name] = self.get_table_stats(name)
+        with self.row_index_lock:
+            stats['_row_index'] = {
+                'total_rows': len(self.row_index),
+                'total_nodes_with_rows': sum(len(nodes) for nodes in self.row_index.values())
+            }
+        return stats
+
+    def optimize_table_indices(self):
+        """清理空行 / 空表，保持索引紧凑"""
+        with self.row_index_lock:
+            for rid in [r for r, nodes in self.row_index.items() if not nodes]:
+                del self.row_index[rid]
+
+        with self.table_index_lock:
+            for tbl, rows in list(self.table_index.items()):
+                for rid in [r for r, row in rows.items() if not row]:
+                    del rows[rid]
+                if not rows:
+                    del self.table_index[tbl]
+
+    # ---------- 高级：JOIN 与 GROUP BY ----------
+
+    def table_join(self, left_table, right_table,
+                   join_type="inner",
+                   on=None,
+                   suffixes=("_x", "_y"),
+                   limit=None):
+        """
+        支持 inner/left/right/outer 四种连接
+        on:
+            None                  -> 两表共有列
+            {"lcol": "rcol"}      -> dict
+            [("lcol1","rcol1"),]  -> 列对列表
+        """
+        def normalize_on(lcols, rcols):
+            if on is None:
+                return [(c, c) for c in lcols & rcols]
+            if isinstance(on, dict):
+                return list(on.items())
+            return list(on)
+
+        with self.table_index_lock:
+            if left_table not in self.table_index or right_table not in self.table_index:
+                return []
+
+            l_rows, r_rows = self.table_index[left_table], self.table_index[right_table]
+            l_cols = {c for r in l_rows.values() for c in r}
+            r_cols = {c for r in r_rows.values() for c in r}
+            pairs = normalize_on(l_cols, r_cols)
+            if not pairs:
+                return []
+
+            # 右表键→行列表
+            r_idx = {}
+            for r_id, rdat in r_rows.items():
+                k = tuple(rdat[p[1]].val if p[1] in rdat else None for p in pairs)
+                r_idx.setdefault(k, []).append((r_id, rdat))
+
+            out = []
+
+            def emit(lid, ldat, rid, rdat):
+                row = {"row_id_left": lid, "row_id_right": rid}
+                for c, n in ldat.items():
+                    row[c + suffixes[0] if c in rdat else c] = n
+                for c, n in rdat.items():
+                    if c in ldat:
+                        row[c + suffixes[1]] = n
+                    else:
+                        row[c] = n
+                out.append(row)
+
+            for lid, ldat in l_rows.items():
+                k = tuple(ldat[p[0]].val if p[0] in ldat else None for p in pairs)
+                matches = r_idx.get(k, [])
+                if matches:
+                    for rid, rdat in matches:
+                        emit(lid, ldat, rid, rdat)
+                        if limit and len(out) >= limit:
+                            return out
+                elif join_type in ("left", "outer"):
+                    emit(lid, ldat, None, {})
+
+            if join_type in ("right", "outer"):
+                l_keys = {tuple(ldat[p[0]].val if p[0] in ldat else None for p in pairs)
+                          for ldat in l_rows.values()}
+                for rid, rdat in r_rows.items():
+                    k = tuple(rdat[p[1]].val if p[1] in rdat else None for p in pairs)
+                    if k not in l_keys:
+                        emit(None, {}, rid, rdat)
+                        if limit and len(out) >= limit:
+                            return out
+            return out
+
+    def group_table(self, table_name, group_by,
+                    agg_funcs=None,
+                    having=None,
+                    limit=None):
+        """
+        GROUP BY + 聚合
+        agg_funcs: {"col": "sum" | "avg" | "min" | "max" | "count" | callable}
+        """
+        if agg_funcs is None:
+            agg_funcs = {}
+
+        with self.table_index_lock:
+            tbl = self.table_index.get(table_name)
+            if not tbl:
+                return []
+
+            grouped = {}
+            for rid, row in tbl.items():
+                key = tuple(row[c].val if c in row else None for c in group_by)
+                bucket = grouped.setdefault(key, defaultdict(list))
+                for col, node in row.items():
+                    bucket[col].append(node.val)
+
+            def apply_agg(values, func):
+                if isinstance(func, str):
+                    if func == "count":
+                        return len(values)
+                    if func == "sum":
+                        return sum(values)
+                    if func == "avg":
+                        return sum(values) / len(values) if values else None
+                    if func == "min":
+                        return min(values) if values else None
+                    if func == "max":
+                        return max(values) if values else None
+                    raise ValueError(func)
+                return func(values)
+
+            results = []
+            for k, cols in grouped.items():
+                row = {group_by[i]: k[i] for i in range(len(group_by))}
+                row["count"] = len(next(iter(cols.values())))  # 近似 count(*)
+                for col, func in agg_funcs.items():
+                    if col in cols:
+                        row[f"{col}_{func if isinstance(func,str) else func.__name__}"] = \
+                            apply_agg(cols[col], func)
+                if having and not having(row):
+                    continue
+                results.append(row)
+                if limit and len(results) >= limit:
+                    break
+            return results
