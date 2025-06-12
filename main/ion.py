@@ -20,6 +20,26 @@ import weakref
 from enum import Enum
 from typing import Any, Dict, List, Optional, Set, Tuple, Union, Callable
 from collections import deque, Counter, defaultdict
+import numpy as np
+import pandas as pd
+try:
+    from sklearn.cluster import KMeans
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.ensemble import IsolationForest
+    from sklearn.neural_network import MLPRegressor
+    from sklearn.model_selection import train_test_split
+    from sklearn.metrics import mean_squared_error
+    from sklearn.linear_model import LinearRegression
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    print("Warning: scikit-learn not available. ML features will be disabled.")
+    SKLEARN_AVAILABLE = False
+
+try:
+    import warnings
+    warnings.filterwarnings('ignore')
+except ImportError:
+    pass
 import functools
 import logging
 import time
@@ -28,7 +48,799 @@ from bsd import ICombinedDataStructure, HashTable, NestedBidirectionalMap, Relat
 
 # 导入ond模块的核心类
 from ond import RNode, obj_to_number
+class MLInterceptorMeta(type):
+    """元类：自动为所有方法添加ML拦截器"""
+    
+    def __new__(mcs, name, bases, namespace, **kwargs):
+        # 定义需要记录的方法模式
+        ml_tracked_methods = {
+            'get_': 'read',
+            'find_': 'search', 
+            'search_': 'search',
+            'query_': 'search',
+            'create_': 'create',
+            'add_': 'create',
+            'update_': 'update',
+            'modify_': 'update',
+            'remove_': 'delete',
+            'delete_': 'delete',
+            'astar_': 'pathfinding',
+            'fuzzy_': 'fuzzy_search',
+            'batch_': 'batch_operation',
+            'analyze_': 'analysis',
+            'optimize_': 'optimization',
+            'calculate_': 'calculation'
+        }
+        
+        # 不应该被拦截的方法（避免递归）
+        excluded_methods = {
+            '__init__', '__getattr__', '__setattr__', '__getattribute__',
+            '__getstate__', '__setstate__', '__str__', '__repr__',
+            '_extract_input_features', '_extract_output_features', 
+            '_record_io_for_training', '_analyze_method_result',
+            'get_current_load_factor', 'hf', '_check_resize',
+            '_trigger_io_training', '_record_batch_statistics',
+            # ML引擎相关方法
+            'record_access', 'record_query_performance', 
+            '_extract_node_features', 'predict_cache_candidates',
+            # 内部辅助方法
+            '_get_node_from_input', '_normalize_row_id', '_index_row',
+            '_remove_row_index', '_index_metadata', '_remove_metadata_index',
+            '_index_tag', '_remove_tag_index', '_index_value_type',
+            # 属性访问相关
+            'keys', 'values', 'items', '__len__', '__contains__',
+            '__getitem__', '__setitem__', '__delitem__'
+        }
+        
+        # 包装符合条件的方法
+        for attr_name, attr_value in list(namespace.items()):
+            if (callable(attr_value) and 
+                not attr_name.startswith('_') and 
+                attr_name not in excluded_methods):
+                
+                # 检查是否匹配需要记录的方法模式
+                access_type = 'unknown'
+                for prefix, atype in ml_tracked_methods.items():
+                    if attr_name.startswith(prefix):
+                        access_type = atype
+                        break
+                
+                # 只包装匹配的方法
+                if access_type != 'unknown':
+                    namespace[attr_name] = mcs._wrap_method(attr_value, attr_name, access_type)
+        
+        return super().__new__(mcs, name, bases, namespace)
+    
+    @staticmethod
+    def _wrap_method(original_method, method_name, access_type):
+        """包装方法以添加ML记录"""
+        def ml_wrapped_method(self, *args, **kwargs):
+            # 检查是否启用ML
+            if not hasattr(self, 'ml_engine') or not self.ml_engine.enabled:
+                return original_method(self, *args, **kwargs)
+            
+            start_time = time.time()
+            
+            try:
+                # 执行原始方法
+                result = original_method(self, *args, **kwargs)
+                execution_time = time.time() - start_time
+                
+                # 安全地记录ML数据（避免递归）
+                try:
+                    # 记录访问模式
+                    if args and hasattr(self, '_extract_node_key_from_arg'):
+                        node_key = self._extract_node_key_from_arg(args[0])
+                        if node_key:
+                            self.ml_engine.record_access(node_key, access_type)
+                    
+                    # 记录查询性能
+                    result_count = 0
+                    if isinstance(result, (list, tuple, set)):
+                        result_count = len(result)
+                    elif result is not None:
+                        result_count = 1
+                    
+                    self.ml_engine.record_query_performance(
+                        method_name, execution_time, result_count
+                    )
+                    
+                    # 简化的IO记录（避免复杂的特征提取）
+                    if hasattr(self.ml_engine, 'io_training_data'):
+                        self.ml_engine.io_training_data.append({
+                            'method_name': method_name,
+                            'args_count': len(args),
+                            'kwargs_count': len(kwargs),
+                            'execution_time': execution_time,
+                            'result_size': result_count,
+                            'access_type': access_type,
+                            'timestamp': time.time()
+                        })
+                        
+                        # 限制训练数据大小
+                        if len(self.ml_engine.io_training_data) > 10000:
+                            self.ml_engine.io_training_data = self.ml_engine.io_training_data[-5000:]
+                
+                except Exception as ml_error:
+                    # ML记录失败不应该影响原始方法
+                    pass
+                
+                return result
+                
+            except Exception as e:
+                execution_time = time.time() - start_time
+                # 记录失败的操作
+                try:
+                    self.ml_engine.record_query_performance(
+                        f"{method_name}_failed", execution_time, 0
+                    )
+                except:
+                    pass
+                raise e
+        
+        return ml_wrapped_method
+# 机器学习智能引擎
+class MLEngine:
+    """ION数据结构的机器学习智能引擎"""
+    
+    def __init__(self, ion_instance):
+        self.ion = ion_instance
+        self.enabled = SKLEARN_AVAILABLE
+        
+        # 访问模式数据
+        self.access_patterns = []
+        self.access_history = defaultdict(list)
+        self.query_performance = []
+        
+        # ML模型
+        self.cache_predictor = None
+        self.partition_optimizer = None
+        self.path_optimizer = None
+        self.anomaly_detector = None
+        self.performance_predictor = None
+        
+        # 特征数据
+        self.io_training_data = []  # 添加这一行
+        self.node_features = {}
+        self.query_features = []
+        
+        # 配置
+        self.learning_enabled = True
+        self.prediction_threshold = 0.7
+        self.anomaly_threshold = -0.5
+        
+        if self.enabled:
+            self._initialize_models()
+    
+    def _initialize_models(self):
+        """初始化机器学习模型"""
+        if not self.enabled:
+            return
+            
+        try:
+            # 缓存预测模型
+            self.cache_predictor = MLPRegressor(
+                hidden_layer_sizes=(50, 30),
+                max_iter=500,
+                random_state=42
+            )
+            
+            # 分区优化模型
+            self.partition_optimizer = KMeans(
+                n_clusters=5,
+                random_state=42
+            )
+            
+            # 异常检测模型
+            self.anomaly_detector = IsolationForest(
+                contamination=0.1,
+                random_state=42
+            )
+            
+            # 性能预测模型
+            self.performance_predictor = LinearRegression()
+            
+            #print("ML引擎初始化成功")
+            
+        except Exception as e:
+            print(f"ML模型初始化失败: {e}")
+            self.enabled = False
+    
+    def record_access(self, node_key, access_type='read', context=None):
+        """记录节点访问模式"""
+        if not self.enabled or not self.learning_enabled:
+            return
+            
+        timestamp = time.time()
+        access_record = {
+            'node_key': node_key,
+            'access_type': access_type,
+            'timestamp': timestamp,
+            'context': context or {}
+        }
+        
+        self.access_patterns.append(access_record)
+        self.access_history[node_key].append(access_record)
+        
+        # 限制历史记录大小
+        if len(self.access_patterns) > 10000:
+            self.access_patterns = self.access_patterns[-5000:]
+    
+    def record_query_performance(self, query_type, execution_time, result_count, context=None):
+        """记录查询性能数据"""
+        if not self.enabled or not self.learning_enabled:
+            return
+            
+        performance_record = {
+            'query_type': query_type,
+            'execution_time': execution_time,
+            'result_count': result_count,
+            'timestamp': time.time(),
+            'context': context or {}
+        }
+        
+        self.query_performance.append(performance_record)
+        
+        # 限制记录大小
+        if len(self.query_performance) > 5000:
+            self.query_performance = self.query_performance[-2500:]
+    
+    def predict_cache_candidates(self, top_k=10):
+        """预测应该缓存的节点"""
+        if not self.enabled or len(self.access_patterns) < 100:
+            return []
+        
+        try:
+            # 计算节点访问特征
+            node_stats = defaultdict(lambda: {
+                'access_count': 0,
+                'recent_accesses': 0,
+                'access_frequency': 0.0,
+                'last_access': 0
+            })
+            
+            current_time = time.time()
+            recent_threshold = current_time - 3600  # 1小时内
+            
+            for record in self.access_patterns:
+                key = record['node_key']
+                timestamp = record['timestamp']
+                
+                node_stats[key]['access_count'] += 1
+                node_stats[key]['last_access'] = max(node_stats[key]['last_access'], timestamp)
+                
+                if timestamp > recent_threshold:
+                    node_stats[key]['recent_accesses'] += 1
+            
+            # 计算访问频率
+            for key, stats in node_stats.items():
+                if stats['access_count'] > 0:
+                    time_span = current_time - (current_time - 86400)  # 24小时
+                    stats['access_frequency'] = stats['access_count'] / time_span
+            
+            # 按综合得分排序
+            candidates = []
+            for key, stats in node_stats.items():
+                score = (
+                    stats['access_frequency'] * 0.4 +
+                    stats['recent_accesses'] * 0.3 +
+                    (1.0 / (current_time - stats['last_access'] + 1)) * 0.3
+                )
+                candidates.append((key, score))
+            
+            candidates.sort(key=lambda x: x[1], reverse=True)
+            return [key for key, score in candidates[:top_k]]
+            
+        except Exception as e:
+            print(f"缓存预测失败: {e}")
+            return []
+    
+    def optimize_partitions(self):
+        """基于访问模式优化分区"""
+        if not self.enabled or len(self.access_patterns) < 200:
+            return {}
+        
+        try:
+            # 构建节点关系矩阵
+            node_keys = list(set(record['node_key'] for record in self.access_patterns))
+            if len(node_keys) < 10:
+                return {}
+            
+            # 创建特征矩阵
+            features = []
+            for key in node_keys:
+                node = self.ion.get_node_by_key(key)
+                if node:
+                    feature_vector = self._extract_node_features(node)
+                    features.append(feature_vector)
+                else:
+                    features.append([0] * 10)  # 默认特征
+            
+            features = np.array(features)
+            
+            # 使用KMeans聚类
+            n_clusters = min(5, len(node_keys) // 10)
+            if n_clusters < 2:
+                return {}
+            
+            self.partition_optimizer.n_clusters = n_clusters
+            cluster_labels = self.partition_optimizer.fit_predict(features)
+            
+            # 生成分区建议
+            partition_suggestions = defaultdict(list)
+            for i, key in enumerate(node_keys):
+                partition_name = f"ml_partition_{cluster_labels[i]}"
+                partition_suggestions[partition_name].append(key)
+            
+            return dict(partition_suggestions)
+            
+        except Exception as e:
+            print(f"分区优化失败: {e}")
+            return {}
+    
+    def _extract_node_features(self, node):
+        """提取节点特征"""
+        features = []
+        
+        # 基本特征
+        features.append(len(node.r) if node.r else 0)  # 关系数量
+        features.append(node.weight if hasattr(node, 'weight') else 1.0)  # 权重
+        features.append(len(node.tags) if node.tags else 0)  # 标签数量
+        features.append(len(node.metadata) if node.metadata else 0)  # 元数据数量
+        
+        # 访问特征
+        access_count = len(self.access_history.get(node.key, []))
+        features.append(access_count)
+        
+        # 最近访问时间
+        recent_access = 0
+        if node.key in self.access_history:
+            recent_records = self.access_history[node.key]
+            if recent_records:
+                recent_access = time.time() - recent_records[-1]['timestamp']
+        features.append(recent_access)
+        
+        # 值类型特征
+        val_type = type(node.val).__name__
+        type_encoding = hash(val_type) % 1000 / 1000.0
+        features.append(type_encoding)
+        
+        # 补充特征到固定长度
+        while len(features) < 10:
+            features.append(0.0)
+        
+        return features[:10]
+    
+    def detect_anomalies(self):
+        """检测异常访问模式"""
+        if not self.enabled or len(self.access_patterns) < 100:
+            return []
+        
+        try:
+            # 构建访问特征
+            features = []
+            current_time = time.time()
+            
+            # 按时间窗口聚合访问数据
+            time_windows = defaultdict(lambda: defaultdict(int))
+            window_size = 300  # 5分钟窗口
+            
+            for record in self.access_patterns:
+                window = int(record['timestamp'] // window_size)
+                time_windows[window][record['node_key']] += 1
+            
+            # 构建特征向量
+            for window, accesses in time_windows.items():
+                feature_vector = [
+                    len(accesses),  # 访问的不同节点数
+                    sum(accesses.values()),  # 总访问次数
+                    max(accesses.values()) if accesses else 0,  # 最大单节点访问次数
+                    len([k for k, v in accesses.items() if v > 10])  # 高频访问节点数
+                ]
+                features.append(feature_vector)
+            
+            if len(features) < 10:
+                return []
+            
+            features = np.array(features)
+            
+            # 训练异常检测模型
+            self.anomaly_detector.fit(features)
+            anomaly_scores = self.anomaly_detector.decision_function(features)
+            
+            # 识别异常
+            anomalies = []
+            for i, score in enumerate(anomaly_scores):
+                if score < self.anomaly_threshold:
+                    window_start = list(time_windows.keys())[i] * window_size
+                    anomalies.append({
+                        'window_start': window_start,
+                        'anomaly_score': score,
+                        'description': '检测到异常访问模式'
+                    })
+            
+            return anomalies
+            
+        except Exception as e:
+            print(f"异常检测失败: {e}")
+            return []
+    
+    def predict_query_performance(self, query_type, context=None):
+        """预测查询性能"""
+        if not self.enabled or len(self.query_performance) < 50:
+            return None
+        
+        try:
+            # 准备训练数据
+            X = []
+            y = []
+            
+            for record in self.query_performance:
+                features = [
+                    hash(record['query_type']) % 1000,
+                    record['result_count'],
+                    len(record.get('context', {}))
+                ]
+                X.append(features)
+                y.append(record['execution_time'])
+            
+            X = np.array(X)
+            y = np.array(y)
+            
+            # 训练模型
+            self.performance_predictor.fit(X, y)
+            
+            # 预测当前查询
+            query_features = [
+                hash(query_type) % 1000,
+                0,  # 结果数量未知
+                len(context or {})
+            ]
+            
+            predicted_time = self.performance_predictor.predict([query_features])[0]
+            return max(0, predicted_time)
+            
+        except Exception as e:
+            print(f"性能预测失败: {e}")
+            return None
+    
+    def optimize_path_finding(self, start_key, goal_key):
+        """优化路径查找的启发式函数"""
+        if not self.enabled:
+            return None
+        
+        try:
+            # 基于历史路径查找数据优化启发式
+            start_node = self.ion.get_node_by_key(start_key)
+            goal_node = self.ion.get_node_by_key(goal_key)
+            
+            if not start_node or not goal_node:
+                return None
+            
+            # 计算智能启发式值
+            def smart_heuristic(current, goal):
+                # 基于节点特征的启发式
+                current_features = self._extract_node_features(current)
+                goal_features = self._extract_node_features(goal)
+                
+                # 计算特征距离
+                feature_distance = np.linalg.norm(
+                    np.array(current_features) - np.array(goal_features)
+                )
+                
+                # 结合传统启发式
+                traditional_h = 1.0  # 默认值
+                
+                return feature_distance * 0.7 + traditional_h * 0.3
+            
+            return smart_heuristic
+            
+        except Exception as e:
+            print(f"路径优化失败: {e}")
+            return None
+    
+    def get_intelligence_stats(self):
+        """获取智能统计信息"""
+        stats = {
+            'enabled': self.enabled,
+            'access_patterns_count': len(self.access_patterns),
+            'query_performance_records': len(self.query_performance),
+            'models_trained': {
+                'cache_predictor': hasattr(self, 'cache_predictor') and self.cache_predictor is not None,
+                'partition_optimizer': hasattr(self, 'partition_optimizer') and self.partition_optimizer is not None,
+                'anomaly_detector': hasattr(self, 'anomaly_detector') and self.anomaly_detector is not None,
+                'performance_predictor': hasattr(self, 'performance_predictor') and self.performance_predictor is not None,
+                'io_predictor': hasattr(self, 'io_predictor') and self.io_predictor is not None
+            },
+            'learning_enabled': self.learning_enabled,
+            'io_training_data_count': len(getattr(self, 'io_training_data', [])),
+            'batch_statistics_count': len(getattr(self, 'batch_statistics', []))
+        }
+        
+        return stats
+    def incremental_learning(self, new_data_batch=None):
+        """增量学习 - 使用新数据更新模型而不重新训练"""
+        if not self.enabled or not self.learning_enabled:
+            return False
+        
+        try:
+            # 缓存预测的增量学习
+            if len(self.access_patterns) >= 200:
+                # 准备增量训练数据
+                recent_patterns = self.access_patterns[-100:]  # 最近100个访问模式
+                
+                # 构建特征和标签
+                X_new = []
+                y_new = []
+                
+                for pattern in recent_patterns:
+                    node = self.ion.get_node_by_key(pattern['node_key'])
+                    if node:
+                        features = self._extract_node_features(node)
+                        # 预测目标：访问频率
+                        access_freq = len(self.access_history[pattern['node_key']]) / (time.time() - pattern['timestamp'] + 1)
+                        X_new.append(features)
+                        y_new.append(access_freq)
+                
+                if len(X_new) >= 10:
+                    X_new = np.array(X_new)
+                    y_new = np.array(y_new)
+                    # 设置模型训练标志
+                    if hasattr(self, 'cache_predictor') and self.cache_predictor is not None:
+                        self.cache_model = self.cache_predictor  # 为了兼容性
+                    if hasattr(self, 'mini_batch_kmeans'):
+                        self.partition_optimizer = self.mini_batch_kmeans
+                        self.partition_model = self.mini_batch_kmeans  # 为了兼容性
+                    # 使用partial_fit进行增量学习（如果模型支持）
+                    if hasattr(self.cache_predictor, 'partial_fit'):
+                        self.cache_predictor.partial_fit(X_new, y_new)
+                    else:
+                        # 重新训练但只使用最近数据
+                        self.cache_predictor.fit(X_new, y_new)
+            
+            # 分区优化的增量学习
+            if len(self.access_patterns) >= 300:
+                # 使用在线K-means更新聚类中心
+                recent_keys = list(set(p['node_key'] for p in self.access_patterns[-150:]))
+                if len(recent_keys) >= 10:
+                    features = []
+                    for key in recent_keys:
+                        node = self.ion.get_node_by_key(key)
+                        if node:
+                            features.append(self._extract_node_features(node))
+                    
+                    if len(features) >= 5:
+                        features = np.array(features)
+                        # 使用mini-batch K-means进行增量更新
+                        from sklearn.cluster import MiniBatchKMeans
+                        if not hasattr(self, 'mini_batch_kmeans'):
+                            self.mini_batch_kmeans = MiniBatchKMeans(
+                                n_clusters=min(5, len(features)//2),
+                                random_state=42,
+                                batch_size=min(10, len(features))
+                            )
+                        self.mini_batch_kmeans.partial_fit(features)
+            
+            return True
+            
+        except Exception as e:
+            print(f"增量学习失败: {e}")
+            return False
+    def train_io_predictor(self):
+        """训练输入输出预测器"""
+        if not hasattr(self, 'io_training_data') or len(self.io_training_data) < 10:
+            return False
+        
+        try:
+            import pandas as pd
+            from sklearn.ensemble import RandomForestRegressor
+            from sklearn.preprocessing import LabelEncoder
+            
+            # 准备训练数据
+            data = []
+            for record in self.io_training_data:
+                # 处理ML拦截器记录的简化格式
+                if 'method_name' in record:
+                    # 新的简化格式
+                    row = {
+                        'method': record.get('method_name', 'unknown'),
+                        'access_type': record.get('access_type', 'unknown'),
+                        'args_count': record.get('args_count', 0),
+                        'kwargs_count': record.get('kwargs_count', 0),
+                        'execution_time': record.get('execution_time', 0.0),
+                        'result_count': record.get('result_size', 0),
+                        'timestamp': record.get('timestamp', 0)
+                    }
+                else:
+                    # 原有的复杂格式（向后兼容）
+                    input_features = record.get('input_features', {})
+                    output_features = record.get('output_features', {})
+                    
+                    row = {
+                        'method': record.get('method', 'unknown'),
+                        'access_type': record.get('access_type', 'unknown'),
+                        'args_count': input_features.get('args_count', 0),
+                        'kwargs_count': input_features.get('kwargs_count', 0),
+                        'execution_time': record.get('execution_time', 0.0),
+                        'result_count': output_features.get('result_count', 0),
+                        'timestamp': record.get('timestamp', 0)
+                    }
+                
+                data.append(row)
+            
+            if not data:
+                return False
+            
+            # 创建DataFrame
+            df = pd.DataFrame(data)
+            
+            # 编码分类特征
+            le_method = LabelEncoder()
+            le_access = LabelEncoder()
+            
+            df['method_encoded'] = le_method.fit_transform(df['method'])
+            df['access_type_encoded'] = le_access.fit_transform(df['access_type'])
+            
+            # 选择特征和目标
+            feature_columns = ['method_encoded', 'access_type_encoded', 'args_count', 'kwargs_count']
+            available_features = [col for col in feature_columns if col in df.columns]
+            
+            if len(available_features) < 2:
+                print(f"特征列不足: {available_features}")
+                return False
+            
+            X = df[available_features]
+            y = df['execution_time']
+            
+            # 训练模型
+            self.io_predictor = RandomForestRegressor(n_estimators=50, random_state=42)
+            self.io_predictor.fit(X, y)
+            
+            # 保存编码器
+            self.method_encoder = le_method
+            self.access_encoder = le_access
+            self.io_feature_columns = available_features
+            
+            return True
+            
+        except Exception as e:
+            print(f"IO预测器训练失败: {e}")
+            return False
+    
+    def predict_method_performance(self, method_name, args_count, kwargs_count, total_input_size, access_type):
+        """预测方法性能"""
+        if not hasattr(self, 'io_predictor'):
+            return None
+        
+        try:
+            # 编码输入
+            method_encoded = self.method_encoder.transform([method_name])[0] if method_name in self.method_encoder.classes_ else 0
+            access_encoded = self.access_type_encoder.transform([access_type])[0] if access_type in self.access_type_encoder.classes_ else 0
+            
+            # 预测
+            # 构建特征向量，只使用训练时可用的特征
+            feature_values = []
+            if 'args_count' in self.io_feature_cols:
+                feature_values.append(args_count)
+            if 'kwargs_count' in self.io_feature_cols:
+                feature_values.append(kwargs_count)
+            if 'total_input_size' in self.io_feature_cols:
+                feature_values.append(total_input_size)
+            if 'method_encoded' in self.io_feature_cols:
+                feature_values.append(method_encoded)
+            if 'access_type_encoded' in self.io_feature_cols:
+                feature_values.append(access_encoded)
 
+            X = [feature_values]
+            prediction = self.io_predictor.predict(X)[0]
+            
+            return {
+                'predicted_execution_time': prediction[0],
+                'predicted_result_count': prediction[1]
+            }
+        except Exception as e:
+            print(f"性能预测失败: {e}")
+            return None
+    def auto_hyperparameter_tuning(self):
+        """自动超参数调优"""
+        if not self.enabled or len(self.query_performance) < 100:
+            return {}
+        
+        try:
+            from sklearn.model_selection import GridSearchCV
+            from sklearn.metrics import make_scorer
+            
+            # 准备数据
+            X = []
+            y = []
+            for record in self.query_performance[-200:]:  # 使用最近200条记录
+                features = [
+                    hash(record['query_type']) % 1000,
+                    record['result_count'],
+                    len(record.get('context', {}))
+                ]
+                X.append(features)
+                y.append(record['execution_time'])
+            
+            if len(X) < 50:
+                return {}
+            
+            X = np.array(X)
+            y = np.array(y)
+            
+            # 为MLPRegressor调优超参数
+            param_grid = {
+                'hidden_layer_sizes': [(30, 20), (50, 30), (100, 50)],
+                'alpha': [0.0001, 0.001, 0.01],
+                'learning_rate_init': [0.001, 0.01, 0.1],
+                'max_iter': [300, 500, 1000]
+            }
+            
+            # 使用网格搜索
+            grid_search = GridSearchCV(
+                MLPRegressor(random_state=42),
+                param_grid,
+                cv=3,
+                scoring='neg_mean_squared_error',
+                n_jobs=-1
+            )
+            
+            grid_search.fit(X, y)
+            
+            # 更新模型
+            self.cache_predictor = grid_search.best_estimator_
+            
+            best_params = grid_search.best_params_
+            best_score = grid_search.best_score_
+            
+            print(f"超参数调优完成 - 最佳参数: {best_params}, 最佳得分: {best_score}")
+            
+            return {
+                'best_params': best_params,
+                'best_score': best_score,
+                'tuning_completed': True
+            }
+            
+        except Exception as e:
+            print(f"超参数调优失败: {e}")
+            return {'tuning_completed': False, 'error': str(e)}
+    
+    def adaptive_learning_schedule(self):
+        """自适应学习调度 - 根据数据量和性能自动调整学习频率"""
+        current_time = time.time()
+        
+        # 根据访问模式数量决定学习频率
+        if len(self.access_patterns) < 100:
+            return False  # 数据太少，不进行学习
+        elif len(self.access_patterns) < 500:
+            # 每收集50个新模式就进行一次增量学习
+            if len(self.access_patterns) % 50 == 0:
+                return self.incremental_learning()
+        elif len(self.access_patterns) < 2000:
+            # 每收集100个新模式就进行一次增量学习
+            if len(self.access_patterns) % 100 == 0:
+                return self.incremental_learning()
+        else:
+            # 数据量大时，每收集200个新模式进行一次学习
+            if len(self.access_patterns) % 200 == 0:
+                return self.incremental_learning()
+        
+        # 每1000个查询性能记录进行一次超参数调优
+        if len(self.query_performance) % 1000 == 0 and len(self.query_performance) > 0:
+            return self.auto_hyperparameter_tuning()
+        
+        return False
+        def enable_learning(self, enabled=True):
+            """启用/禁用学习功能"""
+            self.learning_enabled = enabled
+        
+        def clear_learning_data(self):
+            """清除学习数据"""
+            self.access_patterns.clear()
+            self.access_history.clear()
+            self.query_performance.clear()
+            self.node_features.clear()
+            self.query_features.clear()
 # 同步系统基础类和接口
 class SyncOperation(Enum):
     """同步操作类型枚举"""
@@ -972,7 +1784,7 @@ class Transaction:
     def __str__(self):
         return f"Transaction(id={self.id}, state={self.state}, modified={len(self.modified_nodes)})"
 
-class ION:
+class ION(metaclass=MLInterceptorMeta):
     """
     IntegratedObjectNetwork类 - 整合OND和ICombinedDataStructure的功能
     提供更高级的对象网络结构和操作能力
@@ -1171,7 +1983,10 @@ class ION:
                 enable_sync=True,                  # 启用同步系统
                 sync_async_mode=False,             # 同步系统异步模式
                 sync_batch_size=100,               # 同步批处理大小
-                sync_batch_timeout=1.0):           # 同步批处理超时时间
+                sync_batch_timeout=1.0,
+                #智能选项
+                enable_learning=True
+                ):           # 同步批处理超时时间
         """初始化ION实例，添加优化参数支持，特别针对大型数据集(10万+)
         
         参数:
@@ -1272,7 +2087,9 @@ class ION:
             'transaction_committed': [],
             'transaction_aborted': []
         }
-        
+        if enable_learning:
+            # 初始化机器学习引擎
+            self.ml_engine = MLEngine(self)
         # 设置IONNode类作为节点类
         self.node_class = self.IONNode
         
@@ -2563,8 +3380,11 @@ class ION:
             row: 表行标识，用于表查找功能
             
         Returns:
-            Node: 创建或更新的节点
+            Nodes: 创建或更新的节点
         """
+        # 记录访问模式
+        #if hasattr(self, 'ml_engine'):
+        #    self.ml_engine.record_access(key, 'create')
         metadata = metadata or {}
         tags = tags or []
         
@@ -2759,6 +3579,9 @@ class ION:
     
     def get_node_by_key(self, key):
         """通过键获取节点"""
+        # 记录访问模式
+        #if hasattr(self, 'ml_engine'):
+        #    self.ml_engine.record_access(key, 'read')
         index = self.hf(key)
         with self.bucket_locks[index]:
             for node in self.buckets[index]:
@@ -2787,6 +3610,9 @@ class ION:
     
     def remove_node_by_key(self, key):
         """通过键删除节点"""
+        # 记录访问模式
+        #if hasattr(self, 'ml_engine'):
+        #    self.ml_engine.record_access(key, 'delete')
         index = self.hf(key)
         with self.bucket_locks[index]:
             bucket = self.buckets[index]
@@ -2875,11 +3701,16 @@ class ION:
     
     def find_by_metadata(self, meta_key, meta_val):
         """通过元数据查找节点"""
+        # 记录访问模式
         key = f"{meta_key}:{meta_val}"
+        #if hasattr(self, 'ml_engine'):
+        #    self.ml_engine.record_access(key, 'metadata')
         return self.metadata_index.get(key, [])
     
     def find_by_tag(self, tag):
         """通过标签查找节点"""
+        #if hasattr(self, 'ml_engine'):
+        #    self.ml_engine.record_access(tag, 'tag')
         return self.tag_index.get(tag, [])
     
     def find_by_value_type(self, type_name):
@@ -2925,6 +3756,9 @@ class ION:
     
     def update_node_value(self, node, new_val):
         """更新节点的值，并同步相关索引"""
+        # 记录访问模式
+        if hasattr(self, 'ml_engine'):
+            self.ml_engine.record_access(node.key, 'update')
         old_val = node.val
         
         # 更新双向映射
@@ -2962,6 +3796,9 @@ class ION:
     
     def update_node_metadata(self, node, new_metadata):
         """更新节点的元数据并同步索引"""
+        # 记录访问模式
+        #if hasattr(self, 'ml_engine'):
+        #    self.ml_engine.record_access(node.key, 'update')
         if not isinstance(new_metadata, dict):
             raise TypeError("元数据必须是字典类型")
             
@@ -3056,6 +3893,14 @@ class ION:
     
     def add_relationship(self, source, target, rel_type=None, rel_weight=1.0, metadata=None):
         """添加关系 (支持多种输入类型)"""
+        # 记录访问模式
+        if hasattr(self, 'ml_engine'):
+            source_node = self._get_node_from_input(source)
+            target_node = self._get_node_from_input(target)
+            if source_node:
+                self.ml_engine.record_access(source_node.key, 'relation_add')
+            if target_node:
+                self.ml_engine.record_access(target_node.key, 'relation_add')
         source_node = self._get_node_from_input(source)
         target_node = self._get_node_from_input(target)
         
@@ -3106,6 +3951,14 @@ class ION:
     
     def remove_relationship(self, source, target, rel_type=None):
         """移除两个节点间的关系"""
+        # 记录访问模式
+        if hasattr(self, 'ml_engine'):
+            source_node = self._get_node_from_input(source)
+            target_node = self._get_node_from_input(target)
+            if source_node:
+                self.ml_engine.record_access(source_node.key, 'relation_remove')
+            if target_node:
+                self.ml_engine.record_access(target_node.key, 'relation_remove')
         source_node = self._get_node_from_input(source)
         target_node = self._get_node_from_input(target)
         
@@ -3159,6 +4012,7 @@ class ION:
         
         双向BFS将复杂度从O(V^d)降低到O(V^(d/2))，其中V是分支因子，d是路径长度
         """
+        start_time = time.time()
         start_node = self._get_node_from_input(start)
         end_node = self._get_node_from_input(end)
         
@@ -3249,7 +4103,12 @@ class ION:
             while node:
                 backward_path.append(node)
                 node = backward_visited[node]
-            
+            path=forward_path + backward_path
+            # 记录查询性能
+            if hasattr(self, 'ml_engine'):
+                execution_time = time.time() - start_time
+                result_count = len(path) if path else 0
+                self.ml_engine.record_query_performance('search_path', execution_time, result_count)
             # 合并路径（不重复添加相遇点）
             return forward_path + backward_path
             
@@ -3262,6 +4121,7 @@ class ION:
         
         根据图的特性和搜索条件自动选择单向或双向BFS，并构建反向索引加速搜索
         """
+        start_time = time.time()
         start_node = self._get_node_from_input(start)
         end_node = self._get_node_from_input(end)
         
@@ -3385,7 +4245,12 @@ class ION:
             while node:
                 backward_path.append(node)
                 node = backward_visited[node]
-            
+            # 记录查询性能
+            path=forward_path + backward_path
+            if hasattr(self, 'ml_engine'):
+                execution_time = time.time() - start_time
+                result_count = len(path) if path else 0
+                self.ml_engine.record_query_performance('search_path_optimized', execution_time, result_count)
             # 合并路径（不重复添加相遇点）
             return forward_path + backward_path
             
@@ -3395,6 +4260,7 @@ class ION:
     def find_related(self, node_input, rel_type=None, max_depth=2):
         """查找与节点相关的所有节点"""
         start_node = self._get_node_from_input(node_input)
+        start_time = time.time()
         if not start_node:
             return []
             
@@ -3414,6 +4280,10 @@ class ION:
                     
         start_node.visited = True
         dfs(start_node, 1)
+        if hasattr(self, 'ml_engine'):
+            execution_time = time.time() - start_time
+            result_count = len(result) if result else 0
+            self.ml_engine.record_query_performance('find_related', execution_time, result_count)
         return list(result)
     
     def find_common_related(self, node1, node2, rel_type=None, max_depth=2):
@@ -3490,6 +4360,7 @@ class ION:
             符合条件的节点列表
         """
         # 不同条件的匹配结果
+        start_time = time.time()
         matching_sets = []
         
         # 1. 按值匹配
@@ -3543,6 +4414,12 @@ class ION:
         
         # 限制结果数量
         result_list = list(result)
+        # 记录查询性能
+        # 记录查询性能
+        if hasattr(self, 'ml_engine'):
+            execution_time = time.time() - start_time
+            result_count = len(result_list) if result_list else 0
+            self.ml_engine.record_query_performance('advanced_search', execution_time, result_count)
         return result_list[:max_results] if max_results else result_list
     
     def get_stats(self):
@@ -3846,6 +4723,7 @@ class ION:
                 'tags': [(节点, 标签, 相似度), ...]
             }
         """
+        start_time = time.time()
         if search_in is None:
             search_in = ['keys', 'values', 'metadata', 'tags']
             
@@ -3977,7 +4855,11 @@ class ION:
             results['tags'].sort(key=lambda x: x[2], reverse=True)
             if max_results:
                 results['tags'] = results['tags'][:max_results]
-        
+        # 记录查询性能
+        if hasattr(self, 'ml_engine'):
+            execution_time = time.time() - start_time
+            result_count = len(results) if results else 0
+            self.ml_engine.record_query_performance('fuzzy_search', execution_time, result_count)
         return results
         
     def advanced_fuzzy_search(self, query, options=None):
@@ -8263,6 +9145,274 @@ class ION:
                         return candidate
                     idx += 1
         return None
+    # =======================机器学习智能方法===============================
+    def enable_ml_learning(self, enabled=True):
+        """启用/禁用机器学习"""
+        if hasattr(self, 'ml_engine'):
+            self.ml_engine.enable_learning(enabled)
+    
+    def get_smart_cache_suggestions(self, top_k=10):
+        """获取智能缓存建议"""
+        if hasattr(self, 'ml_engine'):
+            return self.ml_engine.predict_cache_candidates(top_k)
+        return []
+    
+    def optimize_partitions_ml(self):
+        """基于机器学习优化分区"""
+        if hasattr(self, 'ml_engine'):
+            suggestions = self.ml_engine.optimize_partitions()
+            
+            # 应用分区建议
+            for partition_name, node_keys in suggestions.items():
+                try:
+                    self.create_partition(partition_name, f"ML优化分区: {len(node_keys)}个节点")
+                    for key in node_keys:
+                        node = self.get_node_by_key(key)
+                        if node:
+                            self.assign_node_to_partition(node, partition_name)
+                except Exception as e:
+                    print(f"应用分区建议失败: {e}")
+            
+            return suggestions
+        return {}
+    
+    def detect_access_anomalies(self):
+        """检测访问异常"""
+        if hasattr(self, 'ml_engine'):
+            return self.ml_engine.detect_anomalies()
+        return []
+    
+    def predict_query_time(self, query_type, context=None):
+        """预测查询执行时间"""
+        if hasattr(self, 'ml_engine'):
+            return self.ml_engine.predict_query_performance(query_type, context)
+        return None
+    
+    def smart_astar_search(self, start, goal, **kwargs):
+        """智能A*搜索（使用ML优化的启发式）"""
+        start_node = self._get_node_from_input(start)
+        goal_node = self._get_node_from_input(goal)
+        
+        if not start_node or not goal_node:
+            return None
+        
+        # 尝试获取ML优化的启发式函数
+        smart_heuristic = None
+        if hasattr(self, 'ml_engine'):
+            smart_heuristic = self.ml_engine.optimize_path_finding(start_node.key, goal_node.key)
+        
+        # 使用智能启发式或回退到标准A*
+        if smart_heuristic:
+            return self.astar_search(start, goal, heuristic_func=smart_heuristic, **kwargs)
+        else:
+            return self.astar_search(start, goal, **kwargs)
+    
+
+    def _extract_node_key_from_arg(self, arg):
+        """从参数中提取节点键"""
+        if isinstance(arg, str):
+            return arg
+        elif hasattr(arg, 'key'):
+            return arg.key
+        elif isinstance(arg, (list, tuple)) and len(arg) > 0:
+            if isinstance(arg[0], str):
+                return arg[0]
+            elif hasattr(arg[0], 'key'):
+                return arg[0].key
+        return None
+    
+    def _analyze_method_result(self, result, method_name, access_type):
+        """分析方法结果"""
+        analysis = {
+            'type': type(result).__name__,
+            'count': 0,
+            'size': 0
+        }
+        
+        if result is None:
+            analysis['count'] = 0
+            analysis['size'] = 0
+        elif isinstance(result, (list, tuple, set)):
+            analysis['count'] = len(result)
+            analysis['size'] = len(str(result))
+        elif isinstance(result, dict):
+            analysis['count'] = len(result)
+            analysis['size'] = len(str(result))
+        elif hasattr(result, '__len__'):
+            try:
+                analysis['count'] = len(result)
+                analysis['size'] = len(str(result))
+            except:
+                analysis['count'] = 1
+                analysis['size'] = len(str(result))
+        else:
+            analysis['count'] = 1 if result else 0
+            analysis['size'] = len(str(result))
+        
+        return analysis
+    
+    def _record_io_for_training(self, method_name, args, kwargs, result, execution_time, access_type):
+        """记录输入输出对用于训练"""
+        if not hasattr(self, 'ml_engine'):
+            return
+        
+        # 构建训练数据
+        training_data = {
+            'method': method_name,
+            'access_type': access_type,
+            'input_features': self._extract_input_features(args, kwargs),
+            'output_features': self._extract_output_features(result),
+            'execution_time': execution_time,
+            'timestamp': time.time(),
+            'context': {
+                'node_count': self.count,
+                'bucket_count': len(self.buckets),
+                'load_factor': self.get_current_load_factor()
+            }
+        }
+        
+        # 添加到ML引擎的训练数据
+        if not hasattr(self.ml_engine, 'io_training_data'):
+            self.ml_engine.io_training_data = []
+        
+        self.ml_engine.io_training_data.append(training_data)
+        
+        # 限制训练数据大小，保持最近的1000条记录
+        if len(self.ml_engine.io_training_data) > 1000:
+            self.ml_engine.io_training_data = self.ml_engine.io_training_data[-1000:]
+        
+        # 每100条记录触发一次增量训练
+        if len(self.ml_engine.io_training_data) % 100 == 0:
+            self._trigger_io_training()
+    
+    def _extract_input_features(self, args, kwargs):
+        """从输入参数中提取特征"""
+        features = {
+            'args_count': len(args),
+            'kwargs_count': len(kwargs),
+            'has_string_args': any(isinstance(arg, str) for arg in args),
+            'has_list_args': any(isinstance(arg, (list, tuple)) for arg in args),
+            'has_dict_args': any(isinstance(arg, dict) for arg in args),
+            'total_input_size': sum(len(str(arg)) for arg in args) + sum(len(str(v)) for v in kwargs.values())
+        }
+        
+        # 添加特定参数特征
+        if args:
+            features['first_arg_type'] = type(args[0]).__name__
+            features['first_arg_size'] = len(str(args[0]))
+        
+        return features
+    
+    def _extract_output_features(self, result):
+        """从输出结果中提取特征"""
+        features = {
+            'result_type': type(result).__name__,
+            'result_size': len(str(result)),
+            'is_empty': result is None or (hasattr(result, '__len__') and len(result) == 0)
+        }
+        
+        if isinstance(result, (list, tuple, set)):
+            features['result_count'] = len(result)
+            features['has_nodes'] = any(hasattr(item, 'key') for item in result)
+        elif isinstance(result, dict):
+            features['result_count'] = len(result)
+            features['dict_keys'] = list(result.keys())[:5]  # 只保存前5个键
+        elif hasattr(result, 'key'):
+            features['result_count'] = 1
+            features['is_node'] = True
+        else:
+            features['result_count'] = 1 if result else 0
+        
+        return features
+    
+    def _record_batch_statistics(self, method_name, args, result, execution_time):
+        """记录批量操作统计"""
+        if not hasattr(self, 'ml_engine'):
+            return
+        
+        batch_stats = {
+            'method': method_name,
+            'input_size': len(args[0]) if args and hasattr(args[0], '__len__') else 0,
+            'output_size': len(result) if hasattr(result, '__len__') else 0,
+            'execution_time': execution_time,
+            'throughput': (len(args[0]) / execution_time) if args and hasattr(args[0], '__len__') and execution_time > 0 else 0,
+            'timestamp': time.time()
+        }
+        
+        if not hasattr(self.ml_engine, 'batch_statistics'):
+            self.ml_engine.batch_statistics = []
+        
+        self.ml_engine.batch_statistics.append(batch_stats)
+        
+        # 保持最近的500条批量统计
+        if len(self.ml_engine.batch_statistics) > 500:
+            self.ml_engine.batch_statistics = self.ml_engine.batch_statistics[-500:]
+
+    def _trigger_io_training(self):
+        """触发输入输出训练"""
+        if not hasattr(self, 'ml_engine') or not hasattr(self.ml_engine, 'io_training_data'):
+            return
+        
+        try:
+            # 使用训练数据进行增量学习
+            self.ml_engine.train_io_predictor()
+        except Exception as e:
+            print(f"IO训练失败: {e}")
+    def get_ml_stats(self):
+        """获取机器学习统计信息"""
+        if hasattr(self, 'ml_engine'):
+            return self.ml_engine.get_intelligence_stats()
+        return {'enabled': False, 'reason': 'ML引擎未初始化'}
+    def trigger_ml_learning(self, force=False):
+        """手动触发机器学习"""
+        if hasattr(self, 'ml_engine'):
+            if force:
+                return self.ml_engine.incremental_learning()
+            else:
+                return self.ml_engine.adaptive_learning_schedule()
+        return False
+    
+    def tune_ml_hyperparameters(self):
+        """手动触发超参数调优"""
+        if hasattr(self, 'ml_engine'):
+            return self.ml_engine.auto_hyperparameter_tuning()
+        return {}
+    
+    def get_ml_recommendations(self):
+        """获取ML推荐"""
+        if not hasattr(self, 'ml_engine'):
+            return {}
+        
+        return {
+            'cache_suggestions': self.get_smart_cache_suggestions(10),
+            'partition_optimization': self.ml_engine.optimize_partitions(),
+            'anomalies': self.detect_access_anomalies(),
+            'performance_stats': self.ml_engine.get_intelligence_stats()
+        }
+    
+    def enable_auto_ml_optimization(self, enabled=True):
+        """启用/禁用自动ML优化"""
+        if hasattr(self, 'ml_engine'):
+            self.ml_engine.enable_learning(enabled)
+            if enabled:
+                # 启动后台自适应学习
+                def auto_learning_worker():
+                    import threading
+                    import time
+                    while getattr(self.ml_engine, 'learning_enabled', False):
+                        time.sleep(300)  # 每5分钟检查一次
+                        try:
+                            self.ml_engine.adaptive_learning_schedule()
+                        except Exception as e:
+                            print(f"自动学习失败: {e}")
+                
+                learning_thread = threading.Thread(target=auto_learning_worker, daemon=True)
+                learning_thread.start()
+    def clear_ml_data(self):
+            """清除机器学习数据"""
+            if hasattr(self, 'ml_engine'):
+                self.ml_engine.clear_learning_data()
+    
 # ===========特殊方法=============
 import subprocess
 import os
