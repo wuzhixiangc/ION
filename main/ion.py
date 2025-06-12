@@ -2588,7 +2588,7 @@ class ION:
                     existing_node_tags = existing_node.tags or []
                     for tag in tags:
                         if tag not in existing_node_tags:
-                            self.update_node_tag(existing_node, tag, add=True)
+                            self.update_node_tag(existing_node, operation='add', tags=tag)
                 
                 # 更新节点权重
                 if existing_node.weight != weight:
@@ -7373,10 +7373,457 @@ class ION:
         self._trigger_event('node_updated', node=node, old_weight=old_weight)
         
         return node
+    def update_relationship_weight(self, source, target, new_weight, rel_type=None):
+        """更新关系权重
+        
+        Args:
+            source: 源节点键或节点对象
+            target: 目标节点键或节点对象  
+            new_weight: 新的权重值
+            rel_type: 关系类型（可选）
+            
+        Returns:
+            bool: 是否更新成功
+        """
+        # 获取源节点和目标节点
+        source_node = self._get_node_from_input(source)
+        target_node = self._get_node_from_input(target)
+        
+        if not source_node or not target_node:
+            return False
+        
+        # 查找并更新关系权重
+        if source_node.r:
+            for relation in source_node.r:
+                # 检查目标节点和关系类型是否匹配
+                if (relation['node'] == target_node and 
+                    (rel_type is None or relation.get('type') == rel_type)):
+                    # 更新权重
+                    old_weight = relation.get('weight', 1.0)
+                    relation['weight'] = new_weight
+                    
+                    # 触发同步事件
+                    self._trigger_sync_event(
+                        SyncOperation.UPDATE, 
+                        node=source_node,
+                        old_value=old_weight,
+                        new_value=new_weight,
+                        context={
+                            'operation': 'update_relationship_weight',
+                            'source': source_node.key,
+                            'target': target_node.key,
+                            'rel_type': rel_type
+                        }
+                    )
+                    
+                    return True
+        
+        return False
+    
+    def update_relationship_metadata(self, source, target, metadata, rel_type=None):
+        """更新关系元数据
+        
+        Args:
+            source: 源节点键或节点对象
+            target: 目标节点键或节点对象
+            metadata: 新的元数据字典
+            rel_type: 关系类型（可选）
+            
+        Returns:
+            bool: 是否更新成功
+        """
+        # 获取源节点和目标节点
+        source_node = self._get_node_from_input(source)
+        target_node = self._get_node_from_input(target)
+        
+        if not source_node or not target_node:
+            return False
+        
+        # 查找并更新关系元数据
+        if source_node.r:
+            for relation in source_node.r:
+                # 检查目标节点和关系类型是否匹配
+                if (relation['node'] == target_node and 
+                    (rel_type is None or relation.get('type') == rel_type)):
+                    # 更新元数据
+                    old_metadata = relation.get('metadata', {})
+                    if metadata:
+                        relation['metadata'] = metadata.copy()
+                    else:
+                        relation['metadata'] = {}
+                    
+                    # 触发同步事件
+                    self._trigger_sync_event(
+                        SyncOperation.UPDATE, 
+                        node=source_node,
+                        old_value=old_metadata,
+                        new_value=metadata,
+                        context={
+                            'operation': 'update_relationship_metadata',
+                            'source': source_node.key,
+                            'target': target_node.key,
+                            'rel_type': rel_type
+                        }
+                    )
+                    
+                    return True
+        
+        return False
+    
+    def get_relationship_info(self, source, target, rel_type=None):
+        """获取关系详细信息
+        
+        Args:
+            source: 源节点键或节点对象
+            target: 目标节点键或节点对象
+            rel_type: 关系类型（可选）
+            
+        Returns:
+            dict: 关系信息，包含weight, metadata, type等
+        """
+        # 获取源节点和目标节点
+        source_node = self._get_node_from_input(source)
+        target_node = self._get_node_from_input(target)
+        
+        if not source_node or not target_node:
+            return None
+        
+        # 查找关系
+        if source_node.r:
+            for relation in source_node.r:
+                # 检查目标节点和关系类型是否匹配
+                if (relation['node'] == target_node and 
+                    (rel_type is None or relation.get('type') == rel_type)):
+                    return {
+                        'source': source_node.key,
+                        'target': target_node.key,
+                        'type': relation.get('type'),
+                        'weight': relation.get('weight', 1.0),
+                        'metadata': relation.get('metadata', {}),
+                        'created_time': relation.get('created_time')
+                    }
+        
+        return None
+    def has_relationship(self,source,target):
+        """获取节点之间是否有关系链
+        Args:
+            source: 源节点键或节点对象
+            target: 目标节点键或节点对象
+            
+        Returns:
+            bool: 节点之间是否有关系链
+        """
+        source_node=self._get_node_from_input(source)
+        target_node=self._get_node_from_input(target)
+        return target_node in source_node.r
+    def get_graph_density(self):
+        """
+        计算图的密度
+        
+        对于无向图：密度 = 2 * |E| / (|V| * (|V| - 1))
+        对于有向图：密度 = |E| / (|V| * (|V| - 1))
+        
+        其中 |E| 是边的数量，|V| 是节点的数量
+        
+        Returns:
+            dict: 包含密度信息的字典
+        """
+        num_nodes = len(self)
+        if num_nodes <= 1:
+            return {
+                'density': 0,
+                'nodes': num_nodes,
+                'edges': 0,
+                'max_possible_edges': 0,
+                'description': '图中节点数量不足，无法计算密度'
+            }
+        
+        # 计算边的数量
+        total_edges = 0
+        directed_edges = 0
+        undirected_edges = 0
+        
+        for bucket in self.buckets:
+            if bucket is not None:
+                current = bucket
+                while current is not None:
+                    node = current
+                    if hasattr(node, 'r') and node.r:
+                        for relation in node.r:
+                            total_edges += 1
+                            # 检查是否为双向边（简单判断：如果目标节点也有指向当前节点的边）
+                            target_node = self.get_node_by_key(relation['target'])
+                            if target_node and hasattr(target_node, 'r') and target_node.r:
+                                reverse_exists = any(
+                                    rel['target'] == node.key for rel in target_node.r
+                                )
+                                if reverse_exists:
+                                    undirected_edges += 1
+                                else:
+                                    directed_edges += 1
+                            else:
+                                directed_edges += 1
+                    current = getattr(current, 'next', None)
+        
+        # 调整边数计算（避免双向边重复计算）
+        actual_undirected_edges = undirected_edges // 2  # 双向边只算一条
+        total_unique_edges = actual_undirected_edges + directed_edges
+        
+        # 计算最大可能的边数
+        max_possible_edges = num_nodes * (num_nodes - 1)  # 有向图的最大边数
+        max_possible_undirected = max_possible_edges // 2  # 无向图的最大边数
+        
+        # 判断图的类型并计算密度
+        if actual_undirected_edges > directed_edges:
+            # 主要是无向图
+            density = (2 * actual_undirected_edges) / max_possible_edges if max_possible_edges > 0 else 0
+            graph_type = "主要为无向图"
+        else:
+            # 主要是有向图
+            density = total_edges / max_possible_edges if max_possible_edges > 0 else 0
+            graph_type = "主要为有向图"
+        
+        return {
+            'density': round(density, 4),
+            'nodes': num_nodes,
+            'total_edges': total_edges,
+            'directed_edges': directed_edges,
+            'undirected_edges': actual_undirected_edges,
+            'unique_edges': total_unique_edges,
+            'max_possible_edges': max_possible_edges,
+            'max_possible_undirected': max_possible_undirected,
+            'graph_type': graph_type,
+            'density_percentage': round(density * 100, 2),
+            'description': f'图密度为 {round(density * 100, 2)}%，{graph_type}'
+        }
+    
+    def analyze_node_density(self, node_key=None):
+        """
+        分析节点的局部密度
+        
+        Args:
+            node_key: 要分析的节点key，如果为None则分析所有节点
+            
+        Returns:
+            dict: 节点密度分析结果
+        """
+        if node_key:
+            # 分析特定节点
+            node = self.get_node_by_key(node_key)
+            if not node:
+                return {'error': f'节点 {node_key} 不存在'}
+            
+            return self._analyze_single_node_density(node)
+        else:
+            # 分析所有节点
+            all_densities = []
+            for bucket in self.buckets:
+                if bucket is not None:
+                    current = bucket
+                    while current is not None:
+                        node = current
+                        density_info = self._analyze_single_node_density(node)
+                        all_densities.append(density_info)
+                        current = getattr(current, 'next', None)
+            
+            if not all_densities:
+                return {'error': '没有找到任何节点'}
+            
+            # 计算统计信息
+            densities = [info['local_density'] for info in all_densities]
+            
+            return {
+                'total_nodes': len(all_densities),
+                'average_density': round(sum(densities) / len(densities), 4),
+                'max_density': max(densities),
+                'min_density': min(densities),
+                'density_distribution': {
+                    'high_density_nodes': len([d for d in densities if d > 0.7]),
+                    'medium_density_nodes': len([d for d in densities if 0.3 <= d <= 0.7]),
+                    'low_density_nodes': len([d for d in densities if d < 0.3])
+                },
+                'top_dense_nodes': sorted(all_densities, key=lambda x: x['local_density'], reverse=True)[:10]
+            }
+    
+    def _analyze_single_node_density(self, node):
+        """
+        分析单个节点的局部密度
+        
+        Args:
+            node: IONNode对象
+            
+        Returns:
+            dict: 单个节点的密度信息
+        """
+        if not hasattr(node, 'r') or not node.r:
+            return {
+                'node_key': node.key,
+                'local_density': 0,
+                'neighbors': 0,
+                'possible_connections': 0,
+                'actual_connections': 0
+            }
+        
+        # 获取邻居节点
+        neighbors = set()
+        for relation in node.r:
+            neighbors.add(relation['target'])
+        
+        neighbor_count = len(neighbors)
+        if neighbor_count <= 1:
+            return {
+                'node_key': node.key,
+                'local_density': 0,
+                'neighbors': neighbor_count,
+                'possible_connections': 0,
+                'actual_connections': 0
+            }
+        
+        # 计算邻居之间的连接数
+        actual_connections = 0
+        for neighbor1_key in neighbors:
+            neighbor1 = self.get_node_by_key(neighbor1_key)
+            if neighbor1 and hasattr(neighbor1, 'r') and neighbor1.r:
+                for relation in neighbor1.r:
+                    if relation['target'] in neighbors and relation['target'] != neighbor1_key:
+                        actual_connections += 1
+        
+        # 避免重复计算双向边
+        actual_connections = actual_connections // 2
+        
+        # 计算可能的最大连接数（邻居之间的完全图）
+        possible_connections = neighbor_count * (neighbor_count - 1) // 2
+        
+        # 计算局部密度
+        local_density = actual_connections / possible_connections if possible_connections > 0 else 0
+        
+        return {
+            'node_key': node.key,
+            'local_density': round(local_density, 4),
+            'neighbors': neighbor_count,
+            'possible_connections': possible_connections,
+            'actual_connections': actual_connections,
+            'density_percentage': round(local_density * 100, 2)
+        }
+    
+    def get_density_statistics(self):
+        """
+        获取图的全面密度统计信息
+        
+        Returns:
+            dict: 包含各种密度统计的详细信息
+        """
+        graph_density = self.get_graph_density()
+        node_density = self.analyze_node_density()
+        
+        # 计算连通性相关的密度指标
+        components_info = self._analyze_connected_components()
+        
+        return {
+            'global_density': graph_density,
+            'node_density_analysis': node_density,
+            'connectivity_analysis': components_info,
+            'density_insights': self._generate_density_insights(graph_density, node_density)
+        }
+    
+    def _analyze_connected_components(self):
+        """
+        分析连通分量
+        
+        Returns:
+            dict: 连通分量信息
+        """
+        visited = set()
+        components = []
+        
+        for bucket in self.buckets:
+            if bucket is not None:
+                current = bucket
+                while current is not None:
+                    node = current
+                    if node.key not in visited:
+                        component = self._get_connected_component(node, visited)
+                        if component:
+                            components.append(component)
+                    current = getattr(current, 'next', None)
+        
+        if not components:
+            return {'components': 0, 'largest_component_size': 0, 'average_component_size': 0}
+        
+        component_sizes = [len(comp) for comp in components]
+        
+        return {
+            'components': len(components),
+            'largest_component_size': max(component_sizes),
+            'smallest_component_size': min(component_sizes),
+            'average_component_size': round(sum(component_sizes) / len(component_sizes), 2),
+            'component_sizes': component_sizes
+        }
+    
+    def _get_connected_component(self, start_node, visited):
+        """
+        获取从指定节点开始的连通分量
+        
+        Args:
+            start_node: 起始节点
+            visited: 已访问节点集合
+            
+        Returns:
+            list: 连通分量中的节点列表
+        """
+        component = []
+        stack = [start_node]
+        
+        while stack:
+            node = stack.pop()
+            if node.key not in visited:
+                visited.add(node.key)
+                component.append(node.key)
+                
+                # 添加所有邻居
+                if hasattr(node, 'r') and node.r:
+                    for relation in node.r:
+                        neighbor = self.get_node_by_key(relation['target'])
+                        if neighbor and neighbor.key not in visited:
+                            stack.append(neighbor)
+        
+        return component
+    
+    def _generate_density_insights(self, graph_density, node_density):
+        """
+        生成密度分析洞察
+        
+        Args:
+            graph_density: 全局密度信息
+            node_density: 节点密度信息
+            
+        Returns:
+            list: 洞察列表
+        """
+        insights = []
+        
+        density = graph_density['density']
+        
+        if density < 0.1:
+            insights.append("图非常稀疏，大部分节点连接较少")
+        elif density < 0.3:
+            insights.append("图较为稀疏，适合使用邻接表存储")
+        elif density < 0.7:
+            insights.append("图密度适中，连接性良好")
+        else:
+            insights.append("图非常稠密，大部分节点之间都有连接")
+        
+        if 'average_density' in node_density:
+            avg_local = node_density['average_density']
+            if avg_local > density * 2:
+                insights.append("存在明显的聚类结构，局部密度远高于全局密度")
+            elif avg_local < density * 0.5:
+                insights.append("图结构较为分散，缺乏明显的聚类")
+        
+        return insights
     # ==================== 表查找功能 ====================
     
 
-        # ==================== 表查找功能 ====================
 
     def _normalize_row_id(self, row_id):
         """将行标识转换为可哈希对象，避免 'unhashable type' 错误"""
@@ -7697,3 +8144,130 @@ class ION:
                 if limit and len(results) >= limit:
                     break
             return results
+    def get_node_by_row(self, row_id):
+        """根据行标识获取单个节点
+        
+        Args:
+            row_id: 行标识符
+            
+        Returns:
+            IONNode: 找到的第一个节点，如果没有找到则返回None
+            
+        Note:
+            如果有多个节点具有相同的row_id，返回第一个找到的节点
+            要获取所有相同row_id的节点，请使用find_nodes_by_row()
+        """
+        if row_id is None:
+            return None
+            
+        row_id = self._normalize_row_id(row_id)
+        
+        with self.row_index_lock:
+            nodes = self.row_index.get(row_id, [])
+            return nodes[0] if nodes else None
+    
+    def get_nodes_by_row_pattern(self, pattern):
+        """根据行标识模式获取节点
+        
+        Args:
+            pattern: 行标识模式（支持通配符 * 和 ?）
+            
+        Returns:
+            List[IONNode]: 匹配模式的所有节点
+        """
+        import fnmatch
+        
+        if pattern is None:
+            return []
+            
+        pattern = self._normalize_row_id(pattern)
+        matching_nodes = []
+        
+        with self.row_index_lock:
+            for row_id, nodes in self.row_index.items():
+                if fnmatch.fnmatch(str(row_id), str(pattern)):
+                    matching_nodes.extend(nodes)
+        
+        return matching_nodes
+    
+    def get_row_statistics(self):
+        """获取行索引统计信息
+        
+        Returns:
+            dict: 包含行索引统计信息的字典
+        """
+        with self.row_index_lock:
+            total_rows = len(self.row_index)
+            total_nodes = sum(len(nodes) for nodes in self.row_index.values())
+            
+            # 计算每行节点数的分布
+            nodes_per_row = [len(nodes) for nodes in self.row_index.values()]
+            
+            stats = {
+                'total_rows': total_rows,
+                'total_nodes_with_rows': total_nodes,
+                'avg_nodes_per_row': total_nodes / total_rows if total_rows > 0 else 0,
+                'max_nodes_per_row': max(nodes_per_row) if nodes_per_row else 0,
+                'min_nodes_per_row': min(nodes_per_row) if nodes_per_row else 0,
+                'rows_with_multiple_nodes': sum(1 for count in nodes_per_row if count > 1),
+                'unique_row_ids': total_rows
+            }
+            
+            return stats
+    def get_row_id(self, node_or_key):
+        """返回节点当前的行 ID（若无则返回 None）
+    
+        Args:
+            node_or_key: 节点对象或节点键
+    
+        Returns:
+            str | None
+        """
+        node = self._get_node_from_input(node_or_key)
+        return node.row if node else None
+    def get_or_assign_row_id(self, node_or_key, row_id=None,
+                         auto_generate=True, prefix="row_", start_index=1):
+        """获取节点行 ID；若不存在则分配一个新的行 ID
+    
+        Args:
+            node_or_key:  节点对象或节点键
+            row_id:       指定行 ID；若传入则直接设置为该 ID
+            auto_generate:当 row_id 为空且节点无行 ID 时，是否自动生成
+            prefix:       自动生成行 ID 的前缀
+            start_index:  自动生成行 ID 的起始编号
+    
+        Returns:
+            str | None: 最终的行 ID；如果无法分配返回 None
+        """
+        node = self._get_node_from_input(node_or_key)
+        if not node:
+            return None
+    
+        # 若已有行 ID，直接返回
+        if node.row:
+            return node.row
+    
+        # 如果调用方显式给出了行 ID
+        if row_id:
+            self.update_node_row(node, row_id)
+            return row_id
+    
+        # 自动生成唯一行 ID
+        if auto_generate:
+            with self.row_index_lock:
+                idx = start_index
+                while True:
+                    candidate = f"{prefix}{idx}"
+                    if candidate not in self.row_index:
+                        self.update_node_row(node, candidate)
+                        return candidate
+                    idx += 1
+        return None
+# ===========特殊方法=============
+import subprocess
+import os
+def system(file=None):
+    if file is None:
+        os.system(f'python3 /Users/$(whoami)/$(cat /usr/local/cpl/cpl_pathset)')
+    else:
+        subprocess.run(['python3','app_ion.py',file])
