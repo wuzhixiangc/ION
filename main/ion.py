@@ -43,8 +43,8 @@ except ImportError:
 import functools
 import logging
 import time
-# 导入bsd模块中的ICombinedDataStructure
-from bsd import ICombinedDataStructure, HashTable, NestedBidirectionalMap, RelationshipChain
+# 导入uti模块中的ICombinedDataStructure
+from uti import ICombinedDataStructure, HashTable, NestedBidirectionalMap, RelationshipChain
 
 # 导入ond模块的核心类
 from ond import RNode, obj_to_number
@@ -91,7 +91,27 @@ class MLInterceptorMeta(type):
             'keys', 'values', 'items', '__len__', '__contains__',
             '__getitem__', '__setitem__', '__delitem__'
         }
-        
+        # 定义需要记录的方法模式
+        node_creation_methods = [
+            'create_node', 'batch_create_nodes', 'batch_create_table_nodes'
+        ]
+
+        node_modification_methods = [
+            'update_node_value', 'update_node_metadata', 'update_node_tag', 
+            'update_node_weight', 'update_node_relations', 'update_node_row',
+            'update_node_val_locker'
+        ]
+
+        node_deletion_methods = [
+            'remove_node_by_key', 'remove_node_by_key_base'
+        ]
+
+        relationship_methods = [
+            'add_relationship', 'remove_relationship', 'batch_add_relationships'
+        ]
+
+        # 所有需要B-tree处理的方法
+        btree_methods = node_creation_methods + node_modification_methods + node_deletion_methods
         # 包装符合条件的方法
         for attr_name, attr_value in list(namespace.items()):
             if (callable(attr_value) and 
@@ -164,8 +184,42 @@ class MLInterceptorMeta(type):
                 except Exception as ml_error:
                     # ML记录失败不应该影响原始方法
                     pass
-                
-                return result
+                # 在MLInterceptorMeta的包装器中使用更精确的B-tree处理
+                def handle_btree_indexing(method_name, args, kwargs, result):
+                    """处理B-tree索引的统一方法"""
+                    if not hasattr(self, 'btree_manager') or not self.btree_manager:
+                        return
+                    
+                    try:
+                        if method_name in ['create_node']:
+                            # 节点创建
+                            if result and hasattr(result, 'key'):
+                                self.smart_btree_insert_node(result, method_context='create')
+                                
+                        elif method_name in ['remove_node_by_key', 'remove_node_by_key_base']:
+                            # 节点删除 - 需要在删除前获取节点
+                            if args:
+                                node = self.get_node_by_key(args[0]) if hasattr(self, 'get_node_by_key') else None
+                                if node:
+                                    self.smart_btree_remove_node(node, method_context='delete')
+                                    
+                        elif method_name.startswith('update_node_'):
+                            # 节点更新 - 重新索引
+                            if args and hasattr(args[0], 'key'):
+                                node = args[0]
+                                self.smart_btree_remove_node(node, method_context='update_pre')
+                                self.smart_btree_insert_node(node, method_context='update_post')
+                                
+                        elif method_name.startswith('batch_'):
+                            # 批量操作
+                            if isinstance(result, list):
+                                for item in result:
+                                    if hasattr(item, 'key'):
+                                        self.smart_btree_insert_node(item, method_context='batch')
+                                        
+                    except Exception as e:
+                        logging.warning(f"B-tree自动索引处理失败: {e}")
+                handle_btree_indexing(method_name, args, kwargs, result)
                 
             except Exception as e:
                 execution_time = time.time() - start_time
@@ -177,7 +231,7 @@ class MLInterceptorMeta(type):
                 except:
                     pass
                 raise e
-        
+            return result
         return ml_wrapped_method
 # 机器学习智能引擎
 class MLEngine:
@@ -211,6 +265,18 @@ class MLEngine:
         
         if self.enabled:
             self._initialize_models()
+        self.exec_rule=False
+        #包装create_size_limit_rule、create_metadata_rule、product_partition_rule、user_partition_rule等示例函数
+        def demonstrate(rule_func):
+            def wrapper(*args,**kwargs):
+                check=input("此函数是示例函数，你确定要执行吗？(y/n):")
+                if check=="y":
+                    return rule_func(*args,**kwargs)
+                else:
+                    import warnings
+                    warnings.warn("示例函数无法执行，请自行实现")
+            return wrapper
+        
     
     def _initialize_models(self):
         """初始化机器学习模型"""
@@ -830,17 +896,17 @@ class MLEngine:
             return self.auto_hyperparameter_tuning()
         
         return False
-        def enable_learning(self, enabled=True):
-            """启用/禁用学习功能"""
-            self.learning_enabled = enabled
-        
-        def clear_learning_data(self):
-            """清除学习数据"""
-            self.access_patterns.clear()
-            self.access_history.clear()
-            self.query_performance.clear()
-            self.node_features.clear()
-            self.query_features.clear()
+    def enable_learning(self, enabled=True):
+        """启用/禁用学习功能"""
+        self.learning_enabled = enabled
+    
+    def clear_learning_data(self):
+        """清除学习数据"""
+        self.access_patterns.clear()
+        self.access_history.clear()
+        self.query_performance.clear()
+        self.node_features.clear()
+        self.query_features.clear()
 # 同步系统基础类和接口
 class SyncOperation(Enum):
     """同步操作类型枚举"""
@@ -1627,6 +1693,7 @@ class LockManager:
         return dfs(start_txn)
 
 
+
 # 自定义异常类
 class TransactionError(Exception):
     """事务相关异常的基类"""
@@ -1647,6 +1714,14 @@ class ConcurrencyError(TransactionError):
 class TransactionAbortError(TransactionError):
     """事务中止异常"""
     pass
+
+class ViolatePartitionRuleError(Exception):
+    """违反分区规则异常"""
+    def __init__(self, message="违反分区规则"):
+        self.message = message
+        super().__init__(self.message)
+    def __str__(self):
+        return self.message
 
 # 事务类
 class Transaction:
@@ -1784,15 +1859,219 @@ class Transaction:
     def __str__(self):
         return f"Transaction(id={self.id}, state={self.state}, modified={len(self.modified_nodes)})"
 
-class ION(metaclass=MLInterceptorMeta):
+class BTreeMixin:
+    """B-tree功能混入类"""
+    
+    def init_btree_support(self):
+        """初始化B-tree支持"""
+        self.btree_manager = ION.BTreeManager(self)
+        
+        # 根据配置创建默认索引
+        if hasattr(self, 'value_index_type') and self.value_index_type == "btree":
+            self.btree_manager.create_btree_index(
+                'value_index', 
+                key_extractor=lambda node: self._value_to_btree_key(node.val)
+            )
+        
+        # 为常用字段创建索引
+        self._create_default_btree_indices()
+    
+    def _create_default_btree_indices(self):
+        """创建默认的B-tree索引"""
+        try:
+            # 节点键索引
+            self.btree_manager.create_btree_index(
+                'key_index',
+                key_extractor=lambda node: str(node.key)
+            )
+            
+            # 权重索引
+            self.btree_manager.create_btree_index(
+                'weight_index',
+                key_extractor=lambda node: float(node.weight)
+            )
+            
+        except Exception as e:
+            logging.error(f"创建默认B-tree索引失败: {e}")
+    
+    def create_btree_index_for_field(self, field_name, key_extractor=None, order=None):
+        """为特定字段创建B-tree索引"""
+        if key_extractor is None:
+            # 默认提取器
+            if field_name == 'metadata':
+                key_extractor = lambda node: str(node.metadata) if node.metadata else ''
+            elif field_name == 'tags':
+                key_extractor = lambda node: '|'.join(sorted(node.tags)) if node.tags else ''
+            elif field_name == 'row':
+                key_extractor = lambda node: str(node.row) if node.row else ''
+            else:
+                key_extractor = lambda node: str(getattr(node, field_name, ''))
+        
+        return self.btree_manager.create_btree_index(field_name + '_index', key_extractor, order)
+    
+    def btree_search(self, index_name, key):
+        """B-tree搜索接口"""
+        return self.btree_manager.search_nodes(index_name, key)
+    
+    def btree_range_search(self, index_name, start_key, end_key):
+        """B-tree范围搜索接口"""
+        return self.btree_manager.range_search_nodes(index_name, start_key, end_key)
+    
+    def btree_insert_node(self, node, index_names=None):
+        """将节点插入到B-tree索引中"""
+        if not hasattr(self, 'btree_manager'):
+            return False
+        
+        if index_names is None:
+            index_names = self.btree_manager.list_indices()
+        
+        success_count = 0
+        for index_name in index_names:
+            if self.btree_manager.insert_node(index_name, node):
+                success_count += 1
+        
+        return success_count > 0
+    
+    def btree_remove_node(self, node, index_names=None):
+        """从B-tree索引中移除节点"""
+        if not hasattr(self, 'btree_manager'):
+            return False
+        
+        if index_names is None:
+            index_names = self.btree_manager.list_indices()
+        
+        success_count = 0
+        for index_name in index_names:
+            try:
+                if index_name == 'value_index':
+                    key = self._value_to_btree_key(node.val)
+                elif index_name == 'key_index':
+                    key = str(node.key)
+                elif index_name == 'weight_index':
+                    key = float(node.weight)
+                else:
+                    continue  # 跳过未知索引
+                
+                if self.btree_manager.remove_node(index_name, key, node):
+                    success_count += 1
+            except Exception as e:
+                logging.error(f"从B-tree索引移除节点失败: {e}")
+        
+        return success_count > 0
+    
+    def get_btree_stats(self):
+        """获取B-tree统计信息"""
+        if hasattr(self, 'btree_manager'):
+            return self.btree_manager.get_index_stats()
+        return None
+    
+    def optimize_btree_indices(self):
+        """优化所有B-tree索引"""
+        if not hasattr(self, 'btree_manager'):
+            return False
+        
+        optimized_count = 0
+        for index_name in self.btree_manager.list_indices():
+            if self.btree_manager.optimize_index(index_name):
+                optimized_count += 1
+        
+        return optimized_count
+    
+    def clear_btree_indices(self):
+        """清空所有B-tree索引"""
+        if hasattr(self, 'btree_manager'):
+            self.btree_manager.clear_all_indices()
+            return True
+        return False
+    
+    def smart_btree_insert_node(self, node, method_context=None):
+        """智能B-tree节点插入，根据上下文选择合适的索引"""
+        if not hasattr(self, 'btree_manager'):
+            return False
+        
+        # 根据节点特征选择要更新的索引
+        target_indices = []
+        
+        # 总是更新基础索引
+        if 'key_index' in self.btree_manager.list_indices():
+            target_indices.append('key_index')
+        
+        # 根据节点值类型选择值索引
+        if 'value_index' in self.btree_manager.list_indices():
+            target_indices.append('value_index')
+        
+        # 根据权重选择权重索引
+        if 'weight_index' in self.btree_manager.list_indices():
+            target_indices.append('weight_index')
+        
+        # 如果有元数据，更新元数据相关索引
+        if node.metadata:
+            for key in node.metadata.keys():
+                metadata_index = f"{key}_metadata_index"
+                if metadata_index in self.btree_manager.list_indices():
+                    target_indices.append(metadata_index)
+        
+        # 执行插入
+        return self.btree_insert_node(node, target_indices)
+    
+    def smart_btree_remove_node(self, node, method_context=None):
+        """智能B-tree节点移除"""
+        if not hasattr(self, 'btree_manager'):
+            return False
+        
+        # 从所有相关索引中移除
+        return self.btree_remove_node(node)
+class ION(BTreeMixin,metaclass=MLInterceptorMeta):
     """
     IntegratedObjectNetwork类 - 整合OND和ICombinedDataStructure的功能
     提供更高级的对象网络结构和操作能力
     """
+    class MethodMovedError(Exception):
+        """当方法被移动到其他位置时抛出的异常"""
+        
+        def __init__(self, original_location: str, new_location: str, message: str = None):
+            """
+            初始化异常
+            
+            Args:
+                original_location: 方法原本所在的位置（类名、模块名等）
+                new_location: 方法新的位置
+                message: 自定义错误消息
+            """
+            self.original_location = original_location
+            self.new_location = new_location
+            self.message = message or f"Method moved from {original_location} to {new_location}"
+            super().__init__(self.message)
+
+        def __str__(self):
+            return f"{self.message}. Please update your code."
+
+        def get_migration_instructions(self) -> str:
+            """获取迁移指引"""
+            return (
+                f"To fix this issue:\n"
+                f"1. Replace references to {self.original_location} with {self.new_location}\n"
+                f"2. Update any import statements if necessary\n"
+                f"3. Check for any method signature changes in the new location\n"
+                f"4. If you wanna use load_from_file/save_to_file, you can use ion_codec.py to load/save the database\n"
+            )    
+    class DataBaseConnectionError(Exception):
+        """数据库连接异常"""
+        def __init__(self, message="数据库连接异常"):
+            self.message = message
+            super().__init__(self.message)
+        def __str__(self):
+            return self.message
     
     class IONNode:
         """节点类，继承和扩展RNode的功能"""
-        def __init__(self, key, val, metadata=None, tags=None, weight=1.0, row=None):
+        TAG='tag'
+        METADATA='metadata'
+        VAL='val'
+        WEIGHT='weight'
+        ROW='row'
+        RELATION='relation'
+        def __init__(self, key, val, metadata=None, tags=None, weight=1.0, row=None , val_locker=None):
             self._key = key
             self._val = val
             self._r = []  # 关系列表
@@ -1804,7 +2083,7 @@ class ION(metaclass=MLInterceptorMeta):
             self._ion_reference = None  # 引用所属的ION实例
             self._partition = None  # 数据分区标识
             self._row = row  # 表行标识，用于表查找功能
-            
+            self._val_locker= val_locker
             # 确保标签被正确处理
             if tags is not None:
                 if isinstance(tags, str):
@@ -1838,6 +2117,13 @@ class ION(metaclass=MLInterceptorMeta):
         @val.setter
         def val(self, new_val):
             """值属性设置器"""
+            if self._val_locker is not None:
+                try:
+                    # 值锁函数返回True表示拒绝设置，False表示允许设置
+                    if self._val_locker(new_val,self.VAL):
+                        raise ValueError(f"值锁拒绝设置新值: {new_val}")
+                except Exception as e:
+                    raise ValueError(f"值锁验证失败: {str(e)}")
             if self._ion_reference:
                 # 如果有ION引用，通过ION更新值
                 self._ion_reference.update_node_value(self, new_val)
@@ -1852,6 +2138,13 @@ class ION(metaclass=MLInterceptorMeta):
         @metadata.setter
         def metadata(self, new_metadata):
             """元数据属性设置器"""
+            if self._val_locker is not None:
+                try:
+                    # 值锁函数返回True表示拒绝设置，False表示允许设置
+                    if self._val_locker(new_metadata,self.METADATA):
+                        raise ValueError(f"值锁拒绝设置新元数据: {new_metadata}")
+                except Exception as e:
+                    raise ValueError(f"值锁验证失败: {str(e)}")
             if self._ion_reference:
                 # 如果有ION引用，通过ION更新元数据
                 self._ion_reference.update_node_metadata(self, new_metadata)
@@ -1880,6 +2173,13 @@ class ION(metaclass=MLInterceptorMeta):
         @weight.setter
         def weight(self, new_weight):
             """权重属性设置器"""
+            if self._val_locker is not None:
+                try:
+                    # 值锁函数返回True表示拒绝设置，False表示允许设置
+                    if self._val_locker(new_weight,self.WEIGHT):
+                        raise ValueError(f"值锁拒绝设置新权重: {new_weight}")
+                except Exception as e:
+                    raise ValueError(f"值锁验证失败: {str(e)}")
             self._weight = float(new_weight)
             
         @property
@@ -1896,9 +2196,46 @@ class ION(metaclass=MLInterceptorMeta):
         def tags(self):
             """标签属性访问器"""
             return self._tags
+        @tags.setter
+        def tags(self, new_tags):
+            """标签属性设置器"""
+            if self._val_locker is not None:
+                # 对每个新标签进行验证
+                if new_tags:
+                    for tag in new_tags:
+                        try:
+                            if self._val_locker(tag,self.TAG):
+                                raise ValueError(f"值锁拒绝设置标签: {tag}")
+                        except Exception as e:
+                            raise ValueError(f"值锁验证失败: {str(e)}")
             
+            # 清除旧标签的索引
+            if self._ion_reference:
+                for old_tag in self._tags:
+                    self._ion_reference._remove_tag_index(old_tag, self)
+            
+            # 设置新标签
+            if new_tags is not None:
+                if isinstance(new_tags, str):
+                    self._tags = {new_tags}
+                else:
+                    self._tags = set(new_tags)
+            else:
+                self._tags = set()
+            
+            # 为新标签建立索引
+            if self._ion_reference:
+                for tag in self._tags:
+                    self._ion_reference._index_tag(tag, self)
         def add_tag(self, tag):
             """添加标签"""
+            if self._val_locker is not None:
+                try:
+                    # 值锁函数返回True表示拒绝设置，False表示允许设置
+                    if self._val_locker(tag,self.TAG):
+                        raise ValueError(f"值锁拒绝添加标签: {tag}")
+                except Exception as e:
+                    raise ValueError(f"值锁验证失败: {str(e)}")
             self._tags.add(tag)
             if self._ion_reference:
                 self._ion_reference._index_tag(tag, self)
@@ -1912,6 +2249,13 @@ class ION(metaclass=MLInterceptorMeta):
             
         def add_relation(self, node, rel_type=None, rel_weight=1.0, metadata=None):
             """添加带类型、权重和元数据的关系"""
+            if self._val_locker is not None:
+                try:
+                    relation_data = {'node': node, 'type': rel_type, 'weight': rel_weight, 'metadata': metadata}
+                    if self._val_locker(relation_data, self.RELATION):
+                        raise ValueError(f"值锁拒绝添加关系: {relation_data}")
+                except Exception as e:
+                    raise ValueError(f"关系值锁验证失败: {str(e)}")
             relation = {
                 'node': node,
                 'type': rel_type,
@@ -1948,14 +2292,287 @@ class ION(metaclass=MLInterceptorMeta):
         @row.setter
         def row(self, new_row):
             """行标识属性设置器"""
+            if self._val_locker is not None:
+                try:
+                    # 值锁函数返回True表示拒绝设置，False表示允许设置
+                    if self._val_locker(new_row,self.ROW):
+                        raise ValueError(f"值锁拒绝设置新行标识: {new_row}")
+                except Exception as e:
+                    raise ValueError(f"值锁验证失败: {str(e)}")
             if self._ion_reference:
                 # 如果有ION引用，通过ION更新行标识
                 self._ion_reference.update_node_row(self, new_row)
             else:
                 self._row = new_row
-        
+        @property
+        def val_locker(self):
+            """值锁访问器"""
+            return self._val_locker
+        @val_locker.setter
+        def val_locker(self, new_val_locker):
+            """值锁设置器"""
+            if self._ion_reference:
+                self._ion_reference.update_node_val_locker(self, new_val_locker)
+            else:
+                self._val_locker = new_val_locker
         def __str__(self):
             return f"IONNode(key={self._key}, val={self._val}, relations={len(self._r)})"
+    class PartitionSet(set):
+        def __init__(self, set_, *args, **kwargs):
+            self.r = []  # 关系列表
+            self.id = id(self)
+            self.metadata = {}  # 分区元数据
+            self.connection_strength = {}  # 连接强度: {partition_id: strength_value}
+            super().__init__(set_, *args, **kwargs)
+        
+        def add_relation(self, partition, promising=True, strength=1.0, metadata=None):
+            """添加分区关系"""
+            if partition is self:
+                return
+            
+            # 检查是否已存在关系，避免重复添加
+            for existing_relation in self.r:
+                if partition in existing_relation:
+                    return
+            relation_data = {
+                'partition': partition,
+                'promising': promising,
+                'strength': strength,
+                'metadata': metadata or {},
+                'created_at': time.time(),
+                'access_count': 0
+            }
+            self.r.append({partition: relation_data})
+            self.connection_strength[partition.id] = strength
+            
+            # 如果是双向连接，自动添加反向关系
+            if not promising:
+                partition.add_relation(self, promising=False, strength=strength, metadata=metadata)
+            
+            return partition
+        
+        def remove_relation(self, partition):
+            """移除分区关系（已修复递归问题）"""
+            found = False
+            for i in self.r[:]:
+                if list(i.keys())[0] == partition:
+                    found = True
+                    relation_data = i[partition]
+                    
+                    # 移除连接强度记录
+                    if partition.id in self.connection_strength:
+                        del self.connection_strength[partition.id]
+                    
+                    # 处理双向关系
+                    if not relation_data['promising']:
+                        if not hasattr(self, '_removing_relation'):
+                            self._removing_relation = True
+                            partition.remove_relation(self)
+                            delattr(self, '_removing_relation')
+                    
+                    self.r.remove(i)
+                    break
+            
+            if not found:
+                raise ValueError(f"分区{partition}不存在")
+        
+        def get_connected_partitions(self, min_strength=0.0):
+            """获取连接的分区列表"""
+            connected = []
+            for relation in self.r:
+                partition = list(relation.keys())[0]
+                relation_data = relation[partition]
+                if relation_data['strength'] >= min_strength:
+                    connected.append({
+                        'partition': partition,
+                        'strength': relation_data['strength'],
+                        'promising': relation_data['promising'],
+                        'metadata': relation_data['metadata']
+                    })
+            return connected
+        
+        def update_connection_strength(self, partition, new_strength):
+            """更新连接强度"""
+            for relation in self.r:
+                if list(relation.keys())[0] == partition:
+                    relation[partition]['strength'] = new_strength
+                    self.connection_strength[partition.id] = new_strength
+                    break
+        def __hash__(self):
+            """使对象可哈希，基于对象ID"""
+            return hash(self.id)
+        def get_relation_path(self, target_partition, max_depth=5):
+            """查找到目标分区的关系路径"""
+            if self == target_partition:
+                return [self]
+            
+            visited = set()
+            queue = [(self, [self])]
+            
+            while queue:
+                current, path = queue.pop(0)
+                
+                if len(path) > max_depth:
+                    continue
+                    
+                if current.id in visited:
+                    continue
+                visited.add(current.id)
+                
+                for relation in current.r:
+                    next_partition = list(relation.keys())[0]
+                    if next_partition == target_partition:
+                        return path + [next_partition]
+                    
+                    if next_partition.id not in visited:
+                        queue.append((next_partition, path + [next_partition]))
+            
+            return None  # 未找到路径
+        def all(self):
+            return set(self)
+        def __repr__(self):
+            return f"PartitionSet(size={len(self)}, metadata={self.metadata}),relations={len(self.r)}"
+    
+    class BTreeManager:
+        """独立的B-tree管理器，专门处理B-tree操作"""
+        
+        def __init__(self, ion_instance, default_order=128):
+            self.ion = ion_instance
+            self.default_order = default_order
+            self.btree_indices = {}  # 存储不同的B-tree索引
+            self.lock = threading.RLock()
+            self.stats = {
+                'total_inserts': 0,
+                'total_searches': 0,
+                'total_range_searches': 0,
+                'indices_count': 0
+            }
+        
+        def create_btree_index(self, index_name, key_extractor=None, order=None):
+            """创建新的B-tree索引"""
+            with self.lock:
+                if index_name in self.btree_indices:
+                    raise ValueError(f"B-tree索引 '{index_name}' 已存在")
+                
+                actual_order = order or self.default_order
+                self.btree_indices[index_name] = {
+                    'index': BTreeIndex(actual_order),
+                    'key_extractor': key_extractor or (lambda node: getattr(node, 'val', node)),
+                    'stats': {'insert_count': 0, 'search_count': 0, 'range_search_count': 0},
+                    'created_at': time.time()
+                }
+                self.stats['indices_count'] += 1
+                return True
+        
+        def drop_btree_index(self, index_name):
+            """删除B-tree索引"""
+            with self.lock:
+                if index_name in self.btree_indices:
+                    del self.btree_indices[index_name]
+                    self.stats['indices_count'] -= 1
+                    return True
+                return False
+        
+        def insert_node(self, index_name, ion_node):
+            """将IONNode插入到B-tree索引中"""
+            if index_name not in self.btree_indices:
+                raise KeyError(f"B-tree索引 '{index_name}' 不存在")
+            
+            btree_info = self.btree_indices[index_name]
+            try:
+                key = btree_info['key_extractor'](ion_node)
+                btree_info['index'].insert(key, ion_node)
+                btree_info['stats']['insert_count'] += 1
+                self.stats['total_inserts'] += 1
+                return True
+            except Exception as e:
+                logging.error(f"B-tree插入失败: {e}")
+                return False
+        
+        def search_nodes(self, index_name, key):
+            """在B-tree索引中搜索节点"""
+            if index_name not in self.btree_indices:
+                return []
+            
+            btree_info = self.btree_indices[index_name]
+            try:
+                result = btree_info['index'].search(key)
+                btree_info['stats']['search_count'] += 1
+                self.stats['total_searches'] += 1
+                return result if isinstance(result, list) else [result] if result else []
+            except Exception as e:
+                logging.error(f"B-tree搜索失败: {e}")
+                return []
+        
+        def range_search_nodes(self, index_name, start_key, end_key):
+            """B-tree范围搜索"""
+            if index_name not in self.btree_indices:
+                return []
+            
+            btree_info = self.btree_indices[index_name]
+            try:
+                result = btree_info['index'].range_search(start_key, end_key)
+                btree_info['stats']['range_search_count'] += 1
+                self.stats['total_range_searches'] += 1
+                return result
+            except Exception as e:
+                logging.error(f"B-tree范围搜索失败: {e}")
+                return []
+        
+        def remove_node(self, index_name, key, node=None):
+            """从B-tree索引中移除节点"""
+            if index_name not in self.btree_indices:
+                return False
+            
+            btree_info = self.btree_indices[index_name]
+            try:
+                btree_info['index'].delete(key, node)
+                return True
+            except Exception as e:
+                logging.error(f"B-tree删除失败: {e}")
+                return False
+        
+        def get_index_stats(self, index_name=None):
+            """获取索引统计信息"""
+            if index_name:
+                if index_name in self.btree_indices:
+                    btree_info = self.btree_indices[index_name]
+                    return {
+                        'index_name': index_name,
+                        'stats': btree_info['stats'],
+                        'btree_stats': btree_info['index'].get_stats(),
+                        'created_at': btree_info['created_at']
+                    }
+                return None
+            else:
+                return {
+                    'global_stats': self.stats,
+                    'indices': {name: info['stats'] for name, info in self.btree_indices.items()}
+                }
+        
+        def list_indices(self):
+            """列出所有B-tree索引"""
+            return list(self.btree_indices.keys())
+        
+        def optimize_index(self, index_name):
+            """优化指定的B-tree索引"""
+            if index_name not in self.btree_indices:
+                return False
+            
+            # 这里可以实现B-tree重平衡等优化逻辑
+            # 暂时只返回成功状态
+            return True
+        
+        def clear_all_indices(self):
+            """清空所有B-tree索引"""
+            with self.lock:
+                self.btree_indices.clear()
+                self.stats = {
+                    'total_inserts': 0,
+                    'total_searches': 0,
+                    'total_range_searches': 0,
+                    'indices_count': 0
+                }
 
     def __init__(self, start=None, size=1024, max_workers=4, load_factor_threshold=0.75, 
                 enable_memory_optimization=False, index_type="hash", cache_strategy="none", 
@@ -1985,7 +2602,8 @@ class ION(metaclass=MLInterceptorMeta):
                 sync_batch_size=100,               # 同步批处理大小
                 sync_batch_timeout=1.0,
                 #智能选项
-                enable_learning=True
+                enable_learning=True,
+                nodes_val_locker=None,              # 节点值锁
                 ):           # 同步批处理超时时间
         """初始化ION实例，添加优化参数支持，特别针对大型数据集(10万+)
         
@@ -2051,7 +2669,7 @@ class ION(metaclass=MLInterceptorMeta):
         self.tag_index = {}  # 标签索引
         self.value_type_index = {}  # 值类型索引
         self.relation_type_index = {}  # 关系类型索引
-        
+        self.nodes_val_locker = nodes_val_locker
         # 性能优化增强: 值索引改进
         self.value_index_type = value_index_type
         self.value_index = {}  # 优化的值索引
@@ -2200,7 +2818,7 @@ class ION(metaclass=MLInterceptorMeta):
         # 性能优化增强: 异步索引
         self.async_indexing = async_indexing
         if async_indexing:
-            self.indexing_queue = deque(maxlen=10000)
+            self.indexing_queue = deque(maxlen=size*10)
             self.indexing_thread = threading.Thread(
                 target=self._async_indexing_worker,
                 daemon=True
@@ -2226,12 +2844,48 @@ class ION(metaclass=MLInterceptorMeta):
         
         # 初始化优化相关组件
         self._init_optimizations()
-        
+        parent_class = self
+        class PartitionRuleDict(dict):
+            """分区规则字典"""
+            def __init__(self,dict_,type_,*args,**kwargs):
+                parent_class.type_ = type_
+                for k,v in dict_.items():
+                    if isinstance(v,set):
+                        self[k]=parent_class.PartitionSet(v)
+                    else:
+                        self[k]=v
+                super().__init__(dict_,*args,**kwargs)
+            def __setitem__(self, key, value):
+                if isinstance(value,set):
+                    value=parent_class.PartitionSet(value) 
+                # 检查是否有规则检查方法
+                if hasattr(parent_class, 'check_partition_rule'):
+                    try:
+                        # 调用规则检查方法
+                        if parent_class.check_partition_rule(key, value, self.type_):
+                            raise ViolatePartitionRuleError(f"违反分区规则 [{self.type_}]: {key} -> {value}")
+                    except AttributeError:
+                        # 如果方法不存在，跳过检查
+                        import warnings
+                        warnings.warn(f"分区规则检查方法 {parent_class.check_partition_rule} 不存在，跳过检查")
+                return super().__setitem__(key, value)
         # 数据分区支持
-        self.partitions = {"default": set()}  # 分区名 -> 节点键集合
-        self.node_partition_mapping = {}  # 节点键 -> 分区名
-        self.partition_locks = {"default": threading.RLock()}  # 分区锁
-        self.partition_stats = {"default": {"access_count": 0, "hit_ratio": 0}}  # 分区统计
+        self.partitions = PartitionRuleDict({"default": set()},type_="partition")  # 分区名 -> 节点键集合
+        self.node_partition_mapping = PartitionRuleDict({},type_="node_partition_mapping")  # 节点键 -> 分区名
+        self.partition_locks = PartitionRuleDict({"default": threading.RLock()},type_="partition_lock")  # 分区锁
+        self.partition_stats = PartitionRuleDict({"default": {"access_count": 0, "hit_ratio": 0}},type_="partition_stats")  # 分区统计
+        self.partition_rules = {}  # 分区规则: 分区名 -> 规则，分区规则不需要进行分区规则检查
+        self.partition_connection_graph = {}  # 分区连接图
+        self.partition_connection_history = []  # 连接历史
+        self.partition_auto_connection_rules = []  # 自动连接规则
+        self.partition_connection_stats = {
+            'total_connections': 0,
+            'connection_operations': 0,
+            'last_analysis': None
+        }
+        
+        # 可选的独立连接管理器
+        self.partition_connection_manager = None  # 延迟初始化
         
         # 分区查询优化
         if self.parallel_query:
@@ -2266,7 +2920,20 @@ class ION(metaclass=MLInterceptorMeta):
         self.table_index = {}  # 表索引: table_name -> {row_id: 节点}
         self.row_index_lock = threading.RLock()  # 行索引锁
         self.table_index_lock = threading.RLock()  # 表索引锁
-    
+        def demonstrate(rule_func):
+            def wrapper(*args,**kwargs):
+                check=input("此函数是示例函数，你确定要执行吗？(y/n):")
+                if check=="y":
+                    return rule_func(*args,**kwargs)
+                else:
+                    import warnings
+                    warnings.warn("示例函数无法执行，请自行实现")
+            return wrapper
+        self.product_partition_rule=demonstrate(self.product_partition_rule)
+        self.user_partition_rule=demonstrate(self.user_partition_rule)
+        # 初始化B-tree支持（在所有其他初始化完成后）
+        if self.value_index_type == "btree":
+            self.init_btree_support()
     def _register_builtin_sync_handlers(self):
         """注册内置的同步处理器示例"""
         if not self.sync_manager:
@@ -2417,7 +3084,81 @@ class ION(metaclass=MLInterceptorMeta):
             return partition_name
             
         return "default"  # 默认返回默认分区
-    
+    def check_partition_rule(self, key, value, rule_type):
+        """
+        检查分区规则（基于函数）
+        """
+        # 如果没有设置规则，默认允许
+        if not hasattr(self, 'partition_rules') or not self.partition_rules:
+            return False
+        
+        try:
+            if rule_type == "partition":
+                # 检查分区规则
+                if key in self.partition_rules:
+                    rule_func = self.partition_rules[key]
+                    if callable(rule_func):
+                        return rule_func(key, value, rule_type)
+                        
+            elif rule_type == "node_partition_mapping":
+                # 检查节点分区映射规则
+                if isinstance(value, str) and value in self.partition_rules:
+                    rule_func = self.partition_rules[value]
+                    if callable(rule_func):
+                        return rule_func(key, value, rule_type)
+                        
+            elif rule_type in ["partition_lock", "partition_stats"]:
+                # 锁和统计通常不需要限制
+                return False
+                
+        except Exception as e:
+            # 规则检查出错时，记录日志但不阻止操作
+            print(f"分区规则检查出错: {e}")
+            return False
+        
+        return False
+
+    def _validate_partition_rule(self, partition_name, nodes_set, rule):
+        """验证分区规则"""
+        if not isinstance(rule, dict):
+            return False
+        
+        # 检查分区大小限制
+        if 'max_size' in rule:
+            if isinstance(nodes_set, set) and len(nodes_set) > rule['max_size']:
+                return True
+        
+        # 检查节点类型限制
+        if 'allowed_node_types' in rule and isinstance(nodes_set, set):
+            for node_key in nodes_set:
+                node = self.get_node_by_key(node_key)
+                if node and hasattr(node, 'metadata'):
+                    node_type = node.metadata.get('type')
+                    if node_type and node_type not in rule['allowed_node_types']:
+                        return True
+        
+        return False
+
+    def _validate_node_assignment_rule(self, node_key, partition_name, rule):
+        """验证节点分配规则"""
+        if not isinstance(rule, dict):
+            return False
+        
+        # 获取节点
+        node = self.get_node_by_key(node_key)
+        if not node:
+            return False
+        
+        # 检查必需的元数据
+        if 'required_metadata' in rule:
+            if not hasattr(node, 'metadata') or not node.metadata:
+                return True
+            
+            for meta_key, meta_value in rule['required_metadata'].items():
+                if node.metadata.get(meta_key) != meta_value:
+                    return True
+        
+        return False
     def split_partition(self, partition_name):
         """当分区大小超过限制时，将分区分裂成多个子分区
         
@@ -2528,7 +3269,812 @@ class ION(metaclass=MLInterceptorMeta):
         
         # 没有匹配的分区条件，返回所有分区
         return list(self.partitions.keys())
-    
+    def add_partition_rule(self, partition_name, rule_func):
+        """
+        添加分区规则函数
+        
+        参数:
+            partition_name: 分区名称
+            rule_func: 规则验证函数
+        """
+        if not hasattr(self, 'partition_rules'):
+            self.partition_rules = {}
+        
+        if not callable(rule_func):
+            raise ValueError("规则必须是可调用的函数")
+        
+        self.partition_rules[partition_name] = rule_func
+        return self
+
+    def remove_partition_rule(self, partition_name):
+        """移除分区规则"""
+        if hasattr(self, 'partition_rules') and partition_name in self.partition_rules:
+            del self.partition_rules[partition_name]
+        return self
+
+    def get_partition_rule(self, partition_name):
+        """获取分区规则"""
+        if hasattr(self, 'partition_rules'):
+            return self.partition_rules.get(partition_name)
+        return None
+    def connect_partitions(self, partition1_name, partition2_name, 
+                      connection_type='bidirectional', strength=1.0, 
+                      metadata=None, auto_create=True):
+        """连接两个分区"""
+        # 获取或创建分区
+        if partition1_name not in self.partitions and auto_create:
+            self.create_partition(partition1_name)
+        if partition2_name not in self.partitions and auto_create:
+            self.create_partition(partition2_name)
+        
+        partition1 = self.partitions.get(partition1_name)
+        partition2 = self.partitions.get(partition2_name)
+        
+        if not partition1 or not partition2:
+            raise ValueError("分区不存在且未启用自动创建")
+        
+        # 建立连接
+        if connection_type == 'bidirectional':
+            partition1.add_relation(partition2, promising=False, strength=strength, metadata=metadata)
+        elif connection_type == 'unidirectional':
+            partition1.add_relation(partition2, promising=True, strength=strength, metadata=metadata)
+        elif connection_type == 'reverse':
+            partition2.add_relation(partition1, promising=True, strength=strength, metadata=metadata)
+        else:
+            raise ValueError(f"不支持的连接类型: {connection_type}")
+        
+        # 更新统计信息
+        self.partition_connection_stats['total_connections'] += 1
+        self.partition_connection_stats['connection_operations'] += 1
+        
+        # 记录连接历史
+        connection_record = {
+            'partition1': partition1_name,
+            'partition2': partition2_name,
+            'type': connection_type,
+            'strength': strength,
+            'timestamp': time.time(),
+            'metadata': metadata or {},
+            'operation': 'connect'
+        }
+        self.partition_connection_history.append(connection_record)
+        
+        # 触发同步事件
+        if self.sync_manager:
+            self._trigger_sync_event(
+                SyncOperation.ADD_RELATION,
+                metadata={'partition_connection': connection_record}
+            )
+        
+        return True
+
+    def disconnect_partitions(self, partition1_name, partition2_name):
+        """断开分区连接"""
+        partition1 = self.partitions.get(partition1_name)
+        partition2 = self.partitions.get(partition2_name)
+        
+        if not partition1 or not partition2:
+            return False
+        
+        try:
+            partition1.remove_relation(partition2)
+            
+            # 更新统计信息
+            self.partition_connection_stats['total_connections'] -= 1
+            self.partition_connection_stats['connection_operations'] += 1
+            
+            # 记录断开历史
+            disconnect_record = {
+                'partition1': partition1_name,
+                'partition2': partition2_name,
+                'timestamp': time.time(),
+                'operation': 'disconnect'
+            }
+            self.partition_connection_history.append(disconnect_record)
+            
+            # 触发同步事件
+            if self.sync_manager:
+                self._trigger_sync_event(
+                    SyncOperation.REMOVE_RELATION,
+                    metadata={'partition_disconnection': disconnect_record}
+                )
+            
+            return True
+        except ValueError:
+            return False
+
+    def find_partition_path(self, start_partition, end_partition, max_depth=5):
+        """查找分区间的连接路径"""
+        start = self.partitions.get(start_partition)
+        end = self.partitions.get(end_partition)
+        
+        if not start or not end:
+            return None
+        
+        return start.get_relation_path(end, max_depth)
+
+    def get_partition_neighbors(self, partition_name, min_strength=0.0):
+        """获取分区的邻居分区"""
+        partition = self.partitions.get(partition_name)
+        if not partition or not isinstance(partition, self.PartitionSet):
+            return []
+        
+        return partition.get_connected_partitions(min_strength)
+
+    def update_partition_connection_strength(self, partition1_name, partition2_name, new_strength):
+        """更新分区连接强度"""
+        partition1 = self.partitions.get(partition1_name)
+        partition2 = self.partitions.get(partition2_name)
+        
+        if partition1 and isinstance(partition1, self.PartitionSet):
+            partition1.update_connection_strength(partition2, new_strength)
+            
+            # 记录更新历史
+            update_record = {
+                'partition1': partition1_name,
+                'partition2': partition2_name,
+                'new_strength': new_strength,
+                'timestamp': time.time(),
+                'operation': 'update_strength'
+            }
+            self.partition_connection_history.append(update_record)
+            return True
+        
+        return False
+
+    def analyze_partition_connectivity(self):
+        """分析分区连接性"""
+        analysis = {
+            'total_partitions': len(self.partitions),
+            'connected_partitions': 0,
+            'isolated_partitions': [],
+            'connection_density': 0.0,
+            'strongest_connections': [],
+            'weakest_connections': [],
+            'connection_patterns': {},
+            'analysis_timestamp': time.time()
+        }
+        
+        total_connections = 0
+        connection_strengths = []
+        
+        for partition_name, partition in self.partitions.items():
+            if isinstance(partition, self.PartitionSet):
+                connections = partition.get_connected_partitions()
+                if connections:
+                    analysis['connected_partitions'] += 1
+                    total_connections += len(connections)
+                    
+                    # 分析连接模式
+                    for conn in connections:
+                        connection_type = 'bidirectional' if not conn['promising'] else 'unidirectional'
+                        if connection_type not in analysis['connection_patterns']:
+                            analysis['connection_patterns'][connection_type] = 0
+                        analysis['connection_patterns'][connection_type] += 1
+                        
+                        connection_strengths.append({
+                            'from': partition_name,
+                            'to': self._get_partition_name_by_object(conn['partition']),
+                            'strength': conn['strength'],
+                            'type': connection_type
+                        })
+                else:
+                    analysis['isolated_partitions'].append(partition_name)
+        
+        # 计算连接密度
+        max_possible_connections = analysis['total_partitions'] * (analysis['total_partitions'] - 1)
+        if max_possible_connections > 0:
+            analysis['connection_density'] = total_connections / max_possible_connections
+        
+        # 找出最强和最弱连接
+        if connection_strengths:
+            connection_strengths.sort(key=lambda x: x['strength'], reverse=True)
+            analysis['strongest_connections'] = connection_strengths[:5]
+            analysis['weakest_connections'] = connection_strengths[-5:]
+        
+        # 更新统计信息
+        self.partition_connection_stats['last_analysis'] = analysis
+        
+        return analysis
+
+    def _get_partition_name_by_object(self, partition_obj):
+        """根据分区对象获取分区名称"""
+        for name, partition in self.partitions.items():
+            if partition == partition_obj:
+                return name
+        return f"unknown_partition_{id(partition_obj)}"
+
+    def cross_partition_query(self, start_partition, query_func, max_hops=3, 
+                            min_strength=0.5, parallel=True):
+        """跨分区查询"""
+        if parallel and hasattr(self, 'partition_executor'):
+            return self._cross_partition_query_parallel(start_partition, query_func, max_hops, min_strength)
+        else:
+            return self._cross_partition_query_sequential(start_partition, query_func, max_hops, min_strength)
+
+    def _cross_partition_query_sequential(self, start_partition, query_func, max_hops, min_strength):
+        """顺序跨分区查询"""
+        results = []
+        visited = set()
+        queue = [(start_partition, 0)]
+        
+        while queue:
+            current_partition, hops = queue.pop(0)
+            
+            if hops > max_hops or current_partition in visited:
+                continue
+            
+            visited.add(current_partition)
+            
+            # 在当前分区执行查询
+            try:
+                partition_nodes = self._get_nodes_from_single_partition(current_partition)
+                partition_results = [node for node in partition_nodes if query_func(node)]
+                results.extend(partition_results)
+            except Exception as e:
+                print(f"分区 {current_partition} 查询失败: {e}")
+                continue
+            
+            # 添加连接的分区到队列
+            neighbors = self.get_partition_neighbors(current_partition, min_strength)
+            for neighbor in neighbors:
+                neighbor_name = self._get_partition_name_by_object(neighbor['partition'])
+                if neighbor_name not in visited:
+                    queue.append((neighbor_name, hops + 1))
+        
+        return results
+
+    def _cross_partition_query_parallel(self, start_partition, query_func, max_hops, min_strength):
+        """并行跨分区查询"""
+        results = []
+        visited = set()
+        current_level = [start_partition]
+        
+        for hop in range(max_hops + 1):
+            if not current_level:
+                break
+            
+            # 并行查询当前层级的所有分区
+            with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                future_to_partition = {}
+                
+                for partition_name in current_level:
+                    if partition_name not in visited:
+                        visited.add(partition_name)
+                        future = executor.submit(self._query_single_partition, partition_name, query_func)
+                        future_to_partition[future] = partition_name
+                
+                # 收集结果
+                for future in concurrent.futures.as_completed(future_to_partition):
+                    try:
+                        partition_results = future.result()
+                        results.extend(partition_results)
+                    except Exception as e:
+                        partition_name = future_to_partition[future]
+                        print(f"分区 {partition_name} 并行查询失败: {e}")
+            
+            # 准备下一层级
+            next_level = []
+            for partition_name in current_level:
+                neighbors = self.get_partition_neighbors(partition_name, min_strength)
+                for neighbor in neighbors:
+                    neighbor_name = self._get_partition_name_by_object(neighbor['partition'])
+                    if neighbor_name not in visited:
+                        next_level.append(neighbor_name)
+            
+            current_level = list(set(next_level))  # 去重
+        
+        return results
+
+    def _query_single_partition(self, partition_name, query_func):
+        """查询单个分区"""
+        partition_nodes = self._get_nodes_from_single_partition(partition_name)
+        return [node for node in partition_nodes if query_func(node)]
+
+    def add_partition_auto_connection_rule(self, rule_func, rule_name=None):
+        """添加自动连接规则"""
+        rule = {
+            'name': rule_name or f"auto_rule_{len(self.partition_auto_connection_rules)}",
+            'function': rule_func,
+            'created_at': time.time(),
+            'applied_count': 0
+        }
+        self.partition_auto_connection_rules.append(rule)
+        return rule['name']
+
+    def apply_partition_auto_connection_rules(self):
+        """应用自动连接规则"""
+        applied_rules = 0
+        for rule in self.partition_auto_connection_rules:
+            try:
+                rule['function'](self)
+                rule['applied_count'] += 1
+                applied_rules += 1
+            except Exception as e:
+                print(f"自动连接规则 {rule['name']} 执行失败: {e}")
+        
+        return applied_rules
+
+    def get_partition_connection_stats(self):
+        """获取分区连接统计信息"""
+        stats = self.partition_connection_stats.copy()
+        stats['history_count'] = len(self.partition_connection_history)
+        stats['auto_rules_count'] = len(self.partition_auto_connection_rules)
+        return stats
+
+    def clear_partition_connection_history(self, keep_recent=100):
+        """清理分区连接历史"""
+        if len(self.partition_connection_history) > keep_recent:
+            self.partition_connection_history = self.partition_connection_history[-keep_recent:]
+
+    def user_partition_rule(key, value, rule_type,ion):
+        """用户分区规则"""
+        
+        if rule_type == "partition":
+            # 检查分区大小限制
+            if isinstance(value, set) and len(value) > 1000:
+                return True  # 违反规则
+        
+        elif rule_type == "node_partition_mapping":
+            # 检查节点是否符合用户分区要求
+            node = ion.get_node_by_key(key)  # 需要访问ION实例
+            if node and hasattr(node, 'metadata'):
+                if node.metadata.get('type') not in ['user', 'admin']:
+                    return True  # 违反规则
+        
+        return False  # 符合规则
+
+    def product_partition_rule(key, value, rule_type,ion):
+        """产品分区规则"""
+        
+        if rule_type == "partition":
+            # 产品分区最多5000个节点
+            if isinstance(value, set) and len(value) > 5000:
+                return True
+        
+        elif rule_type == "node_partition_mapping":
+            # 只允许产品类型节点
+            node = ion.get_node_by_key(key)
+            if node and hasattr(node, 'metadata'):
+                if node.metadata.get('category') != 'product':
+                    return True
+        
+        return False
+    def create_size_limit_rule(max_size):
+        """创建大小限制规则的工厂函数"""
+        def size_rule(key, value, rule_type):
+            if rule_type == "partition" and isinstance(value, set):
+                return len(value) > max_size
+            return False
+        return size_rule
+
+    def create_metadata_rule(self,required_metadata):
+        """创建元数据要求规则的工厂函数"""
+        def metadata_rule(key, value, rule_type):
+            if rule_type == "node_partition_mapping":
+                node = self.get_node_by_key(key)  # 需要ION实例引用
+                if node and hasattr(node, 'metadata'):
+                    for meta_key, meta_value in required_metadata.items():
+                        if node.metadata.get(meta_key) != meta_value:
+                            return True
+            return False
+        return metadata_rule
+    def partition_join(self, left_partition, right_partition, 
+                  join_type="inner", 
+                  on_condition=None,
+                  result_partition=None,
+                  merge_strategy="union",
+                  max_workers=None,
+                  return_format="nodes",
+                  join_metadata=None):
+        """
+        分区连接方法 - 基于条件连接两个分区的数据
+        
+        参数:
+            left_partition: 左分区名称
+            right_partition: 右分区名称  
+            join_type: 连接类型 "inner"|"left"|"right"|"outer"|"cross"
+            on_condition: 连接条件函数 func(left_node, right_node) -> bool
+            result_partition: 结果分区名称，None表示不创建新分区
+            merge_strategy: 合并策略 "union"|"intersection"|"custom"|"left_priority"|"right_priority"
+            max_workers: 并行处理的最大工作线程数
+            return_format: 返回格式 "nodes"|"pairs"|"merged"|"statistics"
+            join_metadata: 连接操作的元数据
+            
+        返回:
+            根据return_format返回不同格式的结果
+        """
+        import time
+        start_time = time.time()
+        
+        # 验证分区存在
+        if left_partition not in self.partitions:
+            raise ValueError(f"左分区不存在: {left_partition}")
+        if right_partition not in self.partitions:
+            raise ValueError(f"右分区不存在: {right_partition}")
+        
+        # 获取分区节点
+        left_nodes = self._get_nodes_from_single_partition(left_partition)
+        right_nodes = self._get_nodes_from_single_partition(right_partition)
+        
+        # 默认连接条件（基于键匹配）
+        if on_condition is None:
+            def default_condition(left_node, right_node):
+                return left_node.key == right_node.key
+            on_condition = default_condition
+        
+        # 执行连接操作
+        join_results = self._execute_partition_join(
+            left_nodes, right_nodes, join_type, on_condition, 
+            merge_strategy, max_workers
+        )
+        
+        # 处理结果分区
+        if result_partition:
+            self._create_join_result_partition(
+                result_partition, join_results, join_metadata
+            )
+        
+        # 记录连接历史
+        join_record = {
+            'left_partition': left_partition,
+            'right_partition': right_partition,
+            'join_type': join_type,
+            'result_count': len(join_results),
+            'execution_time': time.time() - start_time,
+            'timestamp': time.time(),
+            'result_partition': result_partition
+        }
+        self.partition_connection_history.append(join_record)
+        
+        # 返回不同格式的结果
+        return self._format_join_results(join_results, return_format, join_record)
+    def inspect_join_results(self, join_results):
+        """检查连接结果的详细内容"""
+        if isinstance(join_results, dict) and 'nodes' in join_results:
+            print("=== 连接结果详情 ===")
+            for i, node in enumerate(join_results['nodes']):
+                print(f"\n节点 {i+1}:")
+                print(f"  键: {node.key}")
+                print(f"  值: {node.val}")
+                if hasattr(node, 'metadata') and node.metadata:
+                    print(f"  元数据: {node.metadata}")
+                if hasattr(node, 'tags') and node.tags:
+                    print(f"  标签: {node.tags}")
+            
+            print(f"\n=== 连接统计 ===")
+            print(f"总连接数: {len(join_results['nodes'])}")
+            join_types = {}
+            for info in join_results['join_info']:
+                jtype = info['join_type']
+                join_types[jtype] = join_types.get(jtype, 0) + 1
+            
+            for jtype, count in join_types.items():
+                print(f"{jtype} 连接: {count} 个")
+    def validate_join_results(self, join_results, expected_count=None):
+        """验证连接结果的正确性"""
+        if not isinstance(join_results, dict):
+            return False, "结果格式错误"
+        
+        if 'nodes' not in join_results or 'join_info' not in join_results:
+            return False, "缺少必要字段"
+        
+        nodes = join_results['nodes']
+        join_info = join_results['join_info']
+        
+        if len(nodes) != len(join_info):
+            return False, f"节点数({len(nodes)})与连接信息数({len(join_info)})不匹配"
+        
+        if expected_count and len(nodes) != expected_count:
+            return False, f"期望{expected_count}个结果，实际{len(nodes)}个"
+        
+        return True, "验证通过"
+    def get_partition_join_stats(self):
+        """获取分区连接的性能统计"""
+        join_history = [h for h in self.partition_connection_history 
+                        if h.get('join_type')]
+
+        if not join_history:
+            return {"message": "暂无连接历史"}
+
+        stats = {
+            'total_joins': len(join_history),
+            'avg_execution_time': sum(h['execution_time'] for h in join_history) / len(join_history),
+            'join_types': {},
+            'avg_result_count': sum(h['result_count'] for h in join_history) / len(join_history),
+            'recent_joins': join_history[-5:]  # 最近5次连接
+        }
+
+        for h in join_history:
+            jtype = h['join_type']
+            stats['join_types'][jtype] = stats['join_types'].get(jtype, 0) + 1
+
+        return stats
+    def _execute_partition_join(self, left_nodes, right_nodes, join_type, 
+                            on_condition, merge_strategy, max_workers):
+        """执行分区连接的核心逻辑"""
+        
+        def process_join_batch(batch_data):
+            """处理连接批次"""
+            left_batch, right_batch = batch_data
+            batch_results = []
+            
+            for left_node in left_batch:
+                matches = []
+                
+                # 查找匹配的右侧节点
+                for right_node in right_batch:
+                    try:
+                        if on_condition(left_node, right_node):
+                            matches.append(right_node)
+                    except Exception as e:
+                        # 连接条件执行失败，跳过
+                        continue
+                
+                # 根据连接类型处理匹配结果
+                if join_type == "inner":
+                    for match in matches:
+                        merged_node = self._merge_nodes(left_node, match, merge_strategy)
+                        batch_results.append({
+                            'left': left_node,
+                            'right': match,
+                            'merged': merged_node,
+                            'join_type': 'inner'
+                        })
+                
+                elif join_type == "left":
+                    if matches:
+                        for match in matches:
+                            merged_node = self._merge_nodes(left_node, match, merge_strategy)
+                            batch_results.append({
+                                'left': left_node,
+                                'right': match,
+                                'merged': merged_node,
+                                'join_type': 'left'
+                            })
+                    else:
+                        # 左连接：保留左侧节点
+                        batch_results.append({
+                            'left': left_node,
+                            'right': None,
+                            'merged': left_node,
+                            'join_type': 'left_only'
+                        })
+                
+                elif join_type == "right":
+                    # 右连接逻辑在后面处理
+                    for match in matches:
+                        merged_node = self._merge_nodes(left_node, match, merge_strategy)
+                        batch_results.append({
+                            'left': left_node,
+                            'right': match,
+                            'merged': merged_node,
+                            'join_type': 'right'
+                        })
+                
+                elif join_type == "outer":
+                    if matches:
+                        for match in matches:
+                            merged_node = self._merge_nodes(left_node, match, merge_strategy)
+                            batch_results.append({
+                                'left': left_node,
+                                'right': match,
+                                'merged': merged_node,
+                                'join_type': 'outer'
+                            })
+                    else:
+                        batch_results.append({
+                            'left': left_node,
+                            'right': None,
+                            'merged': left_node,
+                            'join_type': 'left_only'
+                        })
+                
+                elif join_type == "cross":
+                    # 笛卡尔积
+                    for right_node in right_batch:
+                        merged_node = self._merge_nodes(left_node, right_node, merge_strategy)
+                        batch_results.append({
+                            'left': left_node,
+                            'right': right_node,
+                            'merged': merged_node,
+                            'join_type': 'cross'
+                        })
+            
+            return batch_results
+        
+        # 并行处理连接
+        if max_workers and len(left_nodes) > 100:
+            # 分批处理
+            batch_size = max(1, len(left_nodes) // (max_workers * 2))
+            left_batches = [left_nodes[i:i+batch_size] 
+                        for i in range(0, len(left_nodes), batch_size)]
+            
+            batch_data = [(batch, right_nodes) for batch in left_batches]
+            batch_results = self.parallel_batch_process(
+                batch_data, process_join_batch, max_workers
+            )
+            
+            # 合并批次结果
+            all_results = []
+            for batch_result in batch_results:
+                if batch_result:
+                    all_results.extend(batch_result)
+        else:
+            # 单线程处理
+            all_results = process_join_batch((left_nodes, right_nodes))
+        
+        # 处理右连接和外连接的右侧未匹配节点
+        if join_type in ["right", "outer"]:
+            matched_right_keys = {result['right'].key for result in all_results 
+                                if result['right'] is not None}
+            
+            for right_node in right_nodes:
+                if right_node.key not in matched_right_keys:
+                    all_results.append({
+                        'left': None,
+                        'right': right_node,
+                        'merged': right_node,
+                        'join_type': 'right_only'
+                    })
+        
+        return all_results
+
+    def _merge_nodes(self, left_node, right_node, merge_strategy):
+        """合并两个节点"""
+        if merge_strategy == "left_priority":
+            return left_node
+        elif merge_strategy == "right_priority":
+            return right_node
+        elif merge_strategy == "union":
+            # 创建新的合并节点
+            merged_key = f"{left_node.key}_{right_node.key}"
+            merged_val = {
+                'left': left_node.val,
+                'right': right_node.val
+            }
+            merged_metadata = {}
+            if hasattr(left_node, 'metadata') and left_node.metadata:
+                merged_metadata.update(left_node.metadata)
+            if hasattr(right_node, 'metadata') and right_node.metadata:
+                for k, v in right_node.metadata.items():
+                    if k in merged_metadata:
+                        merged_metadata[f"right_{k}"] = v
+                    else:
+                        merged_metadata[k] = v
+            
+            merged_tags = set()
+            if hasattr(left_node, 'tags') and left_node.tags:
+                merged_tags.update(left_node.tags)
+            if hasattr(right_node, 'tags') and right_node.tags:
+                merged_tags.update(right_node.tags)
+            
+            return self.IONNode(
+                key=merged_key,
+                val=merged_val,
+                metadata=merged_metadata,
+                tags=list(merged_tags)
+            )
+        elif merge_strategy == "intersection":
+            # 只保留共同的元数据和标签
+            merged_key = f"{left_node.key}_{right_node.key}"
+            merged_val = {
+                'left': left_node.val,
+                'right': right_node.val
+            }
+            
+            # 交集元数据
+            merged_metadata = {}
+            if (hasattr(left_node, 'metadata') and left_node.metadata and 
+                hasattr(right_node, 'metadata') and right_node.metadata):
+                for k in left_node.metadata:
+                    if k in right_node.metadata and left_node.metadata[k] == right_node.metadata[k]:
+                        merged_metadata[k] = left_node.metadata[k]
+            
+            # 交集标签
+            merged_tags = set()
+            if (hasattr(left_node, 'tags') and left_node.tags and 
+                hasattr(right_node, 'tags') and right_node.tags):
+                merged_tags = set(left_node.tags) & set(right_node.tags)
+            
+            return self.IONNode(
+                key=merged_key,
+                val=merged_val,
+                metadata=merged_metadata,
+                tags=list(merged_tags)
+            )
+        else:
+            # 默认返回左节点
+            return left_node
+
+    def _create_join_result_partition(self, result_partition, join_results, join_metadata):
+        """创建连接结果分区"""
+        if result_partition not in self.partitions:
+            self.create_partition(result_partition, 
+                                description=f"Join result partition",
+                                rule=None)
+        
+        # 将合并后的节点添加到结果分区
+        for result in join_results:
+            merged_node = result['merged']
+            if merged_node:
+                # 添加连接元数据
+                if join_metadata:
+                    if not hasattr(merged_node, 'metadata'):
+                        merged_node.metadata = {}
+                    merged_node.metadata.update(join_metadata)
+                
+                # 分配到结果分区
+                self.assign_node_to_partition(merged_node, result_partition)
+
+    def _format_join_results(self, join_results, return_format, join_record):
+        """格式化连接结果"""
+        if return_format == "nodes":
+            return [result['merged'] for result in join_results if result['merged']]
+        
+        elif return_format == "pairs":
+            return [(result['left'], result['right']) for result in join_results]
+        
+        elif return_format == "merged":
+            return {
+                'nodes': [result['merged'] for result in join_results if result['merged']],
+                'join_info': [
+                    {
+                        'left_key': result['left'].key if result['left'] else None,
+                        'right_key': result['right'].key if result['right'] else None,
+                        'join_type': result['join_type']
+                    }
+                    for result in join_results
+                ]
+            }
+        
+        elif return_format == "statistics":
+            stats = {
+                'total_results': len(join_results),
+                'join_types': {},
+                'execution_time': join_record['execution_time'],
+                'left_partition': join_record['left_partition'],
+                'right_partition': join_record['right_partition']
+            }
+            
+            for result in join_results:
+                join_type = result['join_type']
+                stats['join_types'][join_type] = stats['join_types'].get(join_type, 0) + 1
+            
+            return stats
+        
+        else:
+            return join_results
+
+    def partition_join_by_metadata(self, left_partition, right_partition, 
+                                metadata_key, result_partition=None):
+        """基于元数据键的分区连接快捷方法"""
+        def metadata_condition(left_node, right_node):
+            left_meta = getattr(left_node, 'metadata', {})
+            right_meta = getattr(right_node, 'metadata', {})
+            return (metadata_key in left_meta and 
+                    metadata_key in right_meta and 
+                    left_meta[metadata_key] == right_meta[metadata_key])
+        
+        return self.partition_join(
+            left_partition, right_partition,
+            join_type="inner",
+            on_condition=metadata_condition,
+            result_partition=result_partition
+        )
+
+    def partition_join_by_value(self, left_partition, right_partition, 
+                            result_partition=None):
+        """基于节点值的分区连接快捷方法"""
+        def value_condition(left_node, right_node):
+            return left_node.val == right_node.val
+        
+        return self.partition_join(
+            left_partition, right_partition,
+            join_type="inner", 
+            on_condition=value_condition,
+            result_partition=result_partition
+        )
     def _init_optimizations(self):
         """初始化优化组件"""
         # 索引优化
@@ -2543,6 +4089,16 @@ class ION(metaclass=MLInterceptorMeta):
             # 实现B+树索引逻辑
             self.btree_order = 128  # B+树阶数
             self.btree_indices = {}  # 字段 -> B+树索引
+            
+            # 初始化值索引B-tree
+            if self.value_index_type == "btree":
+                self.value_btree_index = BTreeIndex(self.btree_order)
+                self.value_btree_lock = threading.RLock()
+        
+        # 初始化值索引系统
+        if self.value_index_type == "btree":
+            self.value_btree_index = BTreeIndex(self.btree_order if hasattr(self, 'btree_order') else 128)
+            self.value_btree_lock = threading.RLock()
         
         # 批处理优化
         self.batch_queue = []
@@ -2860,14 +4416,130 @@ class ION(metaclass=MLInterceptorMeta):
             
         except Exception as e:
             logging.error(f"自动优化失败: {e}")
+    def _index_value_btree(self, value, node):
+        """将节点值索引到B-tree"""
+        if hasattr(self, 'btree_manager') and 'value_index' in self.btree_manager.list_indices():
+            self.btree_manager.insert_node('value_index', node)
+        if not hasattr(self, 'value_btree_index'):
+            return
+            
+        try:
+            # 将值转换为可比较的键
+            key = self._value_to_btree_key(value)
+            self.value_btree_index.insert(key, node)
+        except Exception as e:
+            logging.error(f"B-tree值索引失败: {e}")
+
+    def _remove_value_btree(self, value, node):
+        """从B-tree值索引中移除节点"""
+        if hasattr(self, 'btree_manager') and 'value_index' in self.btree_manager.list_indices():
+            key = self._value_to_btree_key(value)
+            self.btree_manager.remove_node('value_index', key, node)
+        if not hasattr(self, 'value_btree_index'):
+            return
+            
+        try:
+            key = self._value_to_btree_key(value)
+            self.value_btree_index.delete(key, node)
+        except Exception as e:
+            logging.error(f"B-tree值索引移除失败: {e}")
+
+    def _value_to_btree_key(self, value):
+        """将值转换为可用于B-tree的键"""
+        if isinstance(value, (int, float)):
+            return value
+        elif isinstance(value, str):
+            # 字符串转换为数值（用于排序）
+            return hash(value) % (2**31)  # 保持在int范围内
+        elif isinstance(value, (list, tuple)):
+            return hash(str(value)) % (2**31)
+        elif isinstance(value, dict):
+            return hash(str(sorted(value.items()))) % (2**31)
+        else:
+            return hash(str(value)) % (2**31)
+
+    def get_nodes_by_value_range_btree(self, min_value=None, max_value=None):
+        """使用B-tree进行值范围搜索"""
+        if not hasattr(self, 'btree_manager') or 'value_index' not in self.btree_manager.list_indices():
+            return []
+        
+        if min_value is None and max_value is None:
+            return []
+        
+        start_key = self._value_to_btree_key(min_value) if min_value is not None else None
+        end_key = self._value_to_btree_key(max_value) if max_value is not None else None
+        
+        return self.btree_manager.range_search_nodes('value_index', start_key, end_key)
+
+    def get_nodes_by_value_btree(self, value):
+        """使用B-tree进行精确值搜索"""
+        if not hasattr(self, 'btree_manager') or 'value_index' not in self.btree_manager.list_indices():
+            return []
+        
+        key = self._value_to_btree_key(value)
+        return self.btree_manager.search_nodes('value_index', key)
+
+        def create_btree_index_for_metadata(self, metadata_key):
+            """为元数据字段创建B-tree索引"""
+            if self.index_type != "b+tree":
+                logging.warning("当前索引类型不是b+tree，无法创建B-tree索引")
+                return False
+            
+            if metadata_key in self.btree_indices:
+                return True
+            
+            try:
+                btree_index = BTreeIndex(self.btree_order)
+                
+                # 为现有节点建立索引
+                for bucket in self.buckets:
+                    for node in bucket:
+                        if node.metadata and metadata_key in node.metadata:
+                            value = node.metadata[metadata_key]
+                            key = self._value_to_btree_key(value)
+                            btree_index.insert(key, node)
+                
+                self.btree_indices[metadata_key] = btree_index
+                logging.info(f"为元数据字段 '{metadata_key}' 创建了B-tree索引")
+                return True
+                
+            except Exception as e:
+                logging.error(f"创建B-tree索引失败: {e}")
+                return False
+
+    def search_metadata_btree(self, metadata_key, min_value=None, max_value=None, exact_value=None):
+        """使用B-tree搜索元数据"""
+        if metadata_key not in self.btree_indices:
+            # 尝试创建索引
+            if not self.create_btree_index_for_metadata(metadata_key):
+                return []
+        
+        btree_index = self.btree_indices[metadata_key]
+        
+        try:
+            if exact_value is not None:
+                key = self._value_to_btree_key(exact_value)
+                result = btree_index.search(key)
+                return result if isinstance(result, list) else [result] if result else []
+            else:
+                min_key = self._value_to_btree_key(min_value) if min_value is not None else float('-inf')
+                max_key = self._value_to_btree_key(max_value) if max_value is not None else float('inf')
+                return btree_index.range_search(min_key, max_key)
+        except Exception as e:
+            logging.error(f"B-tree元数据搜索失败: {e}")
+            return []
+
     
-    def create_partition(self, partition_name, description=None):
+
+
+
+    def create_partition(self, partition_name, description=None,rule=None):
         """创建新的数据分区
         
         参数:
             partition_name: 分区名称
             description: 分区描述
-            
+            rule: 分区规则
         返回:
             bool: 是否创建成功
         """
@@ -2894,7 +4566,8 @@ class ION(metaclass=MLInterceptorMeta):
                 self.partition_executor = concurrent.futures.ThreadPoolExecutor(
                     max_workers=min(len(self.partitions), self.max_workers)
                 )
-                
+            if rule:
+                self.add_partition_rule(partition_name, rule)
             return True
     
     def delete_partition(self, partition_name, move_nodes_to=None):
@@ -3368,7 +5041,7 @@ class ION(metaclass=MLInterceptorMeta):
         """获取当前负载因子"""
         return self.count / self.size if self.size > 0 else 1.0
     
-    def create_node(self, key, val=None, metadata=None, tags=None, weight=1.0, row=None):
+    def create_node(self, key, val=None, metadata=None, tags=None, weight=1.0, row=None, val_locker=None):
         """创建新节点或更新现有节点，支持自动分区
         
         Args:
@@ -3387,7 +5060,8 @@ class ION(metaclass=MLInterceptorMeta):
         #    self.ml_engine.record_access(key, 'create')
         metadata = metadata or {}
         tags = tags or []
-        
+        if val_locker is None:
+            val_locker=self.nodes_val_locker
         # 1. 检查节点是否已存在
         existing_node = self.get_node_by_key(key)
         
@@ -3414,12 +5088,22 @@ class ION(metaclass=MLInterceptorMeta):
                 if existing_node.weight != weight:
                     self.update_node_weight(existing_node, weight)
                 
+                # 更新节点行
+                if existing_node.row != row:
+                    self.update_node_row(existing_node, row)
+                
+                # 更新节点类型
+                if existing_node.type != val_locker:
+                    self.update_node_type(existing_node, val_locker)
+                
             return existing_node
         
         # 3. 创建新节点
         with self.lock:
             # 创建新的IONNode实例
-            new_node = self.node_class(key, val, metadata, tags, weight, row)
+            if val_locker is None:
+                val_locker = self.nodes_val_locker
+            new_node = self.node_class(key, val, metadata, tags, weight, row, val_locker)
             
             # 计算键的哈希值并确定存储桶
             bucket_index = self.hf(key)  # 使用类的哈希函数计算索引
@@ -3781,7 +5465,7 @@ class ION(metaclass=MLInterceptorMeta):
             self._index_value_type(new_val, node)
         
         # 更新节点值
-        node._val = new_val
+        node.val = new_val
         
         # 更新组合数据结构
         self._combined_data.put(key, new_val, metadata=node.metadata)
@@ -3806,7 +5490,7 @@ class ION(metaclass=MLInterceptorMeta):
         
         # 如果节点没有metadata属性，初始化它
         if node.metadata is None:
-            node._metadata = {}
+            node.metadata = {}
             
         # 获取旧元数据的键值对
         old_meta_pairs = set()
@@ -3815,7 +5499,7 @@ class ION(metaclass=MLInterceptorMeta):
                 old_meta_pairs.add((key, value))
         
         # 更新节点的元数据
-        node._metadata.update(new_metadata)
+        node.metadata.update(new_metadata)
         
         # 获取新元数据的键值对
         new_meta_pairs = set()
@@ -3864,7 +5548,7 @@ class ION(metaclass=MLInterceptorMeta):
                         del self.relation_type_index[rel_type]
         
         # 更新关系列表
-        node._r = new_relations or []
+        node.r = new_relations or []
         
         # 添加新的关系类型索引
         for relation in node.r:
@@ -4476,61 +6160,345 @@ class ION(metaclass=MLInterceptorMeta):
     
     def save_to_file(self, filename):
         """保存数据库到文件"""
-        try:
-            print("开始保存数据库...")
+        raise self.MethodMovedError(
+            original_location="ION.save_to_file",
+            new_location="ion_codec.IONCodec.save_to_file",
+            message="更好的文件加载/保存数据库功能在ion_codec.py中"
+        )
+#        try:
+#            print("开始保存数据库...")
             
-            with open(filename, 'wb') as f:
-                pickle.dump(self, f, protocol=2)
+#            with open(filename, 'wb') as f:
+#                pickle.dump(self, f, protocol=2)
                 
-            print(f"成功保存到: {filename}")
-            return True
-        except Exception as e:
-            print(f"保存失败: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
+#            print(f"成功保存到: {filename}")
+#            return True
+#        except Exception as e:
+#            print(f"保存失败: {e}")
+#            import traceback
+#            traceback.print_exc()
+#            return False
             
     @classmethod
     def load_from_file(cls, filename, max_workers=4):
         """从文件加载数据库"""
-        try:
-            print(f"开始从 {filename} 加载数据库...")
-            
-            with open(filename, 'rb') as f:
-                ion = pickle.load(f)
-            
-            # 如果加载的对象不是ION实例，尝试按旧格式加载
-            if not isinstance(ion, cls):
-                print("使用旧格式加载...")
-                with open(filename, 'rb') as f:
-                    data = pickle.load(f)
+        raise cls.MethodMovedError(
+            original_location="ION.load_from_file",
+            new_location="ion_codec.IONCodec.load_from_file",
+            message="更好的文件加载/保存数据库功能在ion_codec.py中"
+        )
+#        try:
+#            print(f"开始从 {filename} 加载数据库...")
+#            
+#            with open(filename, 'rb') as f:
+#                ion = pickle.load(f)
+#   
+#            # 如果加载的对象不是ION实例，尝试按旧格式加载
+#            if not isinstance(ion, cls):
+#                print("使用旧格式加载...")
+#                with open(filename, 'rb') as f:
+#                    data = pickle.load(f)
                     
                 # 创建新实例
-                ion = cls(size=data.get('size', 1024), 
-                max_workers=max_workers,
-                         load_factor_threshold=data.get('load_factor_threshold', 0.75))
+#                ion = cls(size=data.get('size', 1024), 
+#                max_workers=max_workers,
+#                         load_factor_threshold=data.get('load_factor_threshold', 0.75))
                          
-                # 使用_prepare_serialization格式的数据加载
-                if 'buckets' in data and isinstance(data['buckets'], list):
-                    # ... 恢复节点和索引的代码保持不变 ...
-                    pass
+                   # 使用_prepare_serialization格式的数据加载
+#                if 'buckets' in data and isinstance(data['buckets'], list):
+#                    # ... 恢复节点和索引的代码保持不变 ...
+#                    pass
             
-            # 确保使用指定的max_workers
-            if hasattr(ion, 'executor') and ion.executor:
-                try:
-                    ion.executor.shutdown(wait=False)
-                except:
-                    pass
-                ion.executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+#               # 确保使用指定的max_workers
+#            if hasattr(ion, 'executor') and ion.executor:
+#                try:
+#                    ion.executor.shutdown(wait=False)
+#                except:
+#                    pass
+#                ion.executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
             
-            print("数据库加载成功")
-            return ion
-        except Exception as e:
-            print(f"加载失败: {e}")
-            import traceback
-            traceback.print_exc()
-            return None
-    
+#            print("数据库加载成功")
+#            return ion
+#        except Exception as e:
+#            print(f"加载失败: {e}")
+#            import traceback
+#            traceback.print_exc()
+#            return None
+    def batch_filter(self, filter_tasks, 
+                    method='filter_pro',
+                    max_workers=None,
+                    result_format='combined',
+                    progress_callback=None,
+                    error_handling='skip'):
+        """
+        批量多线程过滤函数，基于self.parallel_batch_process实现
+        
+        参数:
+            filter_tasks: 过滤任务列表或字典
+            method: 使用的过滤方法 'filter_pro' 或 'find_nodes_by_filter'
+            max_workers: 最大工作线程数
+            result_format: 结果格式 'combined'|'separate'|'indexed'
+            progress_callback: 进度回调函数
+            error_handling: 错误处理方式 'skip'|'raise'|'collect'
+            
+        返回:
+            根据result_format返回不同格式的结果
+        """
+        import time
+        
+        if not filter_tasks:
+            return [] if result_format == 'combined' else {}
+        
+        # 验证过滤方法
+        if method not in ['filter_pro', 'find_nodes_by_filter']:
+            raise ValueError(f"不支持的过滤方法: {method}")
+        
+        # 标准化任务格式
+        if isinstance(filter_tasks, dict):
+            task_list = [(task_id, task_params) for task_id, task_params in filter_tasks.items()]
+        elif isinstance(filter_tasks, list):
+            task_list = [(f"task_{i}", task) for i, task in enumerate(filter_tasks)]
+        else:
+            raise ValueError("filter_tasks 必须是字典或列表格式")
+        
+        # 统计信息
+        completed_count = 0
+        total_tasks = len(task_list)
+        
+        def execute_single_filter_task(task_info):
+            """执行单个过滤任务的处理函数"""
+            nonlocal completed_count
+            
+            task_id, task_params = task_info
+            start_time = time.time()
+            
+            try:
+                if method == 'filter_pro':
+                    # 执行filter_pro任务
+                    filter_func = task_params.get('filter_func')
+                    if not filter_func:
+                        raise ValueError(f"任务 {task_id}: filter_func 参数是必需的")
+                    
+                    # 构建filter_pro参数，过滤掉None值
+                    filter_pro_params = {
+                        k: v for k, v in {
+                            'filter_func': filter_func,
+                            'include_fields': task_params.get('include_fields'),
+                            'exclude_fields': task_params.get('exclude_fields'),
+                            'max_results': task_params.get('max_results'),
+                            'parallel': task_params.get('parallel', False),  # 避免嵌套并行
+                            'max_workers': task_params.get('max_workers'),
+                            'return_format': task_params.get('return_format', 'nodes'),
+                            'sort_by': task_params.get('sort_by'),
+                            'sort_reverse': task_params.get('sort_reverse', False),
+                            'group_by': task_params.get('group_by'),
+                            'transform_func': task_params.get('transform_func'),
+                            'pre_filter': task_params.get('pre_filter'),
+                            'post_filter': task_params.get('post_filter'),
+                            'context': task_params.get('context')
+                        }.items() if v is not None
+                    }
+                    
+                    result = self.filter_pro(**filter_pro_params)
+                    
+                elif method == 'find_nodes_by_filter':
+                    # 执行find_nodes_by_filter任务
+                    filter_func = task_params.get('filter_func')
+                    if not filter_func:
+                        raise ValueError(f"任务 {task_id}: filter_func 参数是必需的")
+                    
+                    partitions = task_params.get('partitions')
+                    result = self.find_nodes_by_filter(filter_func, partitions)
+                
+                execution_time = time.time() - start_time
+                completed_count += 1
+                
+                # 进度回调
+                if progress_callback:
+                    try:
+                        progress_callback(completed_count, total_tasks, {
+                            'task_id': task_id,
+                            'execution_time': execution_time,
+                            'result_count': len(result) if hasattr(result, '__len__') else 0
+                        })
+                    except Exception as e:
+                        if error_handling == 'raise':
+                            raise
+                        print(f"进度回调执行出错: {e}")
+                
+                return {
+                    'task_id': task_id,
+                    'result': result,
+                    'execution_time': execution_time,
+                    'task_params': task_params,
+                    'success': True,
+                    'error': None
+                }
+                
+            except Exception as e:
+                                    execution_time = time.time() - start_time
+                                    error_result = {
+                                        'task_id': task_id,
+                                        'result': None,
+                                        'execution_time': execution_time,
+                                        'task_params': task_params,
+                                        'success': False,
+                                        'error': str(e)
+                                    }
+                                    
+                                    if error_handling == 'raise':
+                                        raise
+                                    elif error_handling == 'skip':
+                                        print(f"任务 {task_id} 执行失败: {e}")
+                                    
+                                    return error_result
+        
+        # 使用parallel_batch_process执行所有任务
+        task_results = self.parallel_batch_process(
+            input_list=task_list,
+            process_func=execute_single_filter_task,
+            max_workers=max_workers
+        )
+        
+        # 分离成功和失败的结果
+        successful_results = {}
+        failed_results = {}
+        
+        for task_result in task_results:
+            if task_result and task_result.get('success', False):
+                successful_results[task_result['task_id']] = task_result
+            elif task_result:
+                failed_results[task_result['task_id']] = task_result
+        
+        # 根据result_format处理结果
+        if result_format == 'combined':
+            # 合并所有成功的结果
+            combined_results = []
+            for task_result in successful_results.values():
+                if isinstance(task_result['result'], list):
+                    combined_results.extend(task_result['result'])
+                elif task_result['result'] is not None:
+                    combined_results.append(task_result['result'])
+            
+            return {
+                'results': combined_results,
+                'task_count': len(successful_results),
+                'error_count': len(failed_results),
+                'errors': failed_results if failed_results else None,
+                'total_execution_time': sum(r['execution_time'] for r in successful_results.values()),
+                'statistics': {
+                    'total_results': len(combined_results),
+                    'successful_tasks': len(successful_results),
+                    'failed_tasks': len(failed_results)
+                }
+            }
+        
+        elif result_format == 'separate':
+            # 分别返回每个任务的结果
+            return {
+                'results': {task_id: task_result['result'] for task_id, task_result in successful_results.items()},
+                'execution_times': {task_id: task_result['execution_time'] for task_id, task_result in successful_results.items()},
+                'errors': failed_results if failed_results else None,
+                'summary': {
+                    'successful_tasks': len(successful_results),
+                    'failed_tasks': len(failed_results),
+                    'total_tasks': len(task_list),
+                    'total_execution_time': sum(r['execution_time'] for r in successful_results.values())
+                }
+            }
+        
+        elif result_format == 'indexed':
+            # 返回带索引的详细结果
+            all_tasks = {**successful_results, **failed_results}
+            
+            return {
+                'tasks': {
+                    task_id: {
+                        'result': task_result['result'],
+                        'execution_time': task_result['execution_time'],
+                        'task_params': task_result['task_params'],
+                        'success': task_result['success'],
+                        'error': task_result.get('error')
+                    } for task_id, task_result in all_tasks.items()
+                },
+                'statistics': {
+                    'total_tasks': len(task_list),
+                    'successful_tasks': len(successful_results),
+                    'failed_tasks': len(failed_results),
+                    'total_results': sum(len(r['result']) if r['result'] and hasattr(r['result'], '__len__') else (1 if r['result'] else 0)
+                                    for r in successful_results.values()),
+                    'average_execution_time': sum(r['execution_time'] for r in all_tasks.values()) / len(all_tasks) if all_tasks else 0,
+                    'total_execution_time': sum(r['execution_time'] for r in all_tasks.values())
+                }
+            }
+        
+        else:
+            # 默认返回原始结果
+            return {
+                'successful_results': successful_results,
+                'failed_results': failed_results
+            }
+
+    def batch_filter_partitions(self, partition_filter_map, 
+                            method='find_nodes_by_filter',
+                            max_workers=None,
+                            merge_by_partition=True):
+        """
+        按分区批量过滤的便捷方法，基于batch_filter实现
+        
+        参数:
+            partition_filter_map: 分区到过滤函数的映射
+            method: 过滤方法
+            max_workers: 最大工作线程数
+            merge_by_partition: 是否按分区合并结果
+            
+        返回:
+            按分区组织的过滤结果
+        """
+        # 构建任务字典
+        filter_tasks = {}
+        
+        for partition_name, filter_config in partition_filter_map.items():
+            task_id = f"partition_{partition_name}"
+            
+            if callable(filter_config):
+                # 如果是函数，构建基本任务参数
+                task_params = {
+                    'filter_func': filter_config,
+                    'partitions': [partition_name] if method == 'find_nodes_by_filter' else None
+                }
+            elif isinstance(filter_config, dict):
+                # 如果是字典，使用提供的参数
+                task_params = filter_config.copy()
+                if method == 'find_nodes_by_filter' and 'partitions' not in task_params:
+                    task_params['partitions'] = [partition_name]
+            else:
+                raise ValueError(f"分区 {partition_name} 的过滤配置必须是函数或字典")
+            
+            filter_tasks[task_id] = task_params
+        
+        # 使用batch_filter执行
+        results = self.batch_filter(
+            filter_tasks=filter_tasks,
+            method=method,
+            max_workers=max_workers,
+            result_format='separate'
+        )
+        
+        # 按分区重新组织结果
+        if merge_by_partition:
+            partition_results = {}
+            for task_id, result in results['results'].items():
+                partition_name = task_id.replace('partition_', '')
+                partition_results[partition_name] = result
+            
+            return {
+                'partition_results': partition_results,
+                'errors': results['errors'],
+                'summary': results['summary']
+            }
+        
+        return results
     # 事件系统
     def _trigger_event(self, event_type, **kwargs):
         """触发事件回调"""
@@ -4555,26 +6523,37 @@ class ION(metaclass=MLInterceptorMeta):
         return self
     
     # 多线程批处理
-    def parallel_batch_process(self, input_list, process_func):
+    def parallel_batch_process(self, input_list, process_func, max_workers=None):
         """并行处理多个节点或操作"""
+        # 使用指定的max_workers或实例默认值
+        if max_workers is None:
+            executor = self.executor
+        else:
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+        
         futures = []
         results = []
         
-        for item in input_list:
-            future = self.executor.submit(process_func, item)
-            futures.append(future)
-            
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                result = future.result()
-                results.append(result)
-            except Exception as e:
-                results.append(None)
-                print(f"Error in parallel processing: {e}")
+        try:
+            for item in input_list:
+                future = executor.submit(process_func, item)
+                futures.append(future)
+                
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    result = future.result()
+                    results.append(result)
+                except Exception as e:
+                    results.append(None)
+                    print(f"Error in parallel processing: {e}")
+        finally:
+                # 如果创建了临时executor，需要关闭它
+            if max_workers is not None:
+                executor.shutdown(wait=True)
                 
         return results
         
-    def batch_create_nodes(self, node_data_list):
+    def batch_create_nodes(self, node_data_list, max_workers=None):
         """批量创建节点"""
         # 预先检查是否需要扩容
         if self.count + len(node_data_list) > self.size * self.load_factor_threshold:
@@ -4590,6 +6569,10 @@ class ION(metaclass=MLInterceptorMeta):
                     return self.create_node(data[0], data[1], data[2])
                 elif len(data) >= 4:
                     return self.create_node(data[0], data[1], data[2], data[3])
+                elif len(data) >= 5:
+                    return self.create_node(data[0], data[1], data[2], data[3], data[4])
+                elif len(data) >= 6:
+                    return self.create_node(data[0], data[1], data[2], data[3], data[4], data[5])
                 else:
                     print(f"错误：元组数据格式不正确 {data}")
                     return None
@@ -4603,35 +6586,54 @@ class ION(metaclass=MLInterceptorMeta):
                     data.get('val'),
                     data.get('metadata'),
                     data.get('tags'),
-                    data.get('weight', 1.0)
+                    data.get('weight', 1.0),
+                    data.get('row'),
+                    data.get('val_locker')
                 )
             else:
                 print(f"错误：不支持的数据类型 {type(data)}")
                 return None
         
-        return self.parallel_batch_process(node_data_list, process_node_data)
+        return self.parallel_batch_process(node_data_list, process_node_data, max_workers=max_workers)
         
-    def batch_add_relationships(self, relationship_list):
-        """批量添加关系"""
-        return self.parallel_batch_process(
-            relationship_list,
-            lambda rel: self.add_relationship(
-                rel['source'], 
-                rel['target'], 
-                rel.get('type'), 
-                rel.get('weight', 1.0),
-                rel.get('metadata')
-            )
-        )
+    def batch_add_relationships(self, relationship_list, max_workers=None):
+        def process_relationship(rel):
+            
+            try:
+                if isinstance(rel, dict):
+                    # 字典格式
+                    source = rel.get('source') or rel.get('from') or rel.get('src')
+                    target = rel.get('target') or rel.get('to') or rel.get('dst')
+                    rel_type = rel.get('type')
+                    weight = rel.get('weight', 1.0)
+                    metadata = rel.get('metadata')
+                elif isinstance(rel, (list, tuple)) and len(rel) >= 2:
+                    # 元组格式
+                    source = rel[0]
+                    target = rel[1]
+                    rel_type = rel[2] if len(rel) > 2 else None
+                    weight = rel[3] if len(rel) > 3 else 1.0
+                    metadata = rel[4] if len(rel) > 4 else None
+                else:
+                    return None
+                    
+                
+                return self.add_relationship(source, target, rel_type, weight, metadata)
+                
+            except Exception as e:
+                return None
+    
+        return self.parallel_batch_process(relationship_list, process_relationship, max_workers=max_workers)
         
-    def batch_update_node_metadata(self, nodes, metadata_dict):
+    def batch_update_node_metadata(self, nodes, metadata_dict,max_workers=None):
         """批量更新节点元数据"""
         return self.parallel_batch_process(
             nodes,
-            lambda node: self.update_node_metadata(node, metadata_dict)
+            lambda node: self.update_node_metadata(node, metadata_dict),
+            max_workers=max_workers
         )
         
-    def batch_add_tags(self, nodes, tags):
+    def batch_add_tags(self, nodes, tags, max_workers=None):
         """批量添加标签"""
         def add_tags_to_node(node):
             node_obj = self._get_node_from_input(node)
@@ -4640,9 +6642,9 @@ class ION(metaclass=MLInterceptorMeta):
                     node_obj.add_tag(tag)
             return node_obj
             
-        return self.parallel_batch_process(nodes, add_tags_to_node)
+        return self.parallel_batch_process(nodes, add_tags_to_node, max_workers=max_workers)
         
-    def batch_update_node_weights(self, nodes, weight_value):
+    def batch_update_node_weights(self, nodes, weight_value, max_workers=None):
         """批量更新节点权重"""
         def update_weight(node):
             node_obj = self._get_node_from_input(node)
@@ -4650,7 +6652,7 @@ class ION(metaclass=MLInterceptorMeta):
                 node_obj.weight = weight_value
             return node_obj
             
-        return self.parallel_batch_process(nodes, update_weight)
+        return self.parallel_batch_process(nodes, update_weight, max_workers=max_workers)
     
     # 字典类似方法
     def __getitem__(self, key):
@@ -5100,7 +7102,7 @@ class ION(metaclass=MLInterceptorMeta):
                 old_tags = set(node_obj.tags)
                 
                 # 清空标签集合
-                node_obj._tags.clear()
+                node_obj.tags.clear()
                 
                 # 移除旧标签的索引
                 for tag in old_tags:
@@ -5200,7 +7202,7 @@ class ION(metaclass=MLInterceptorMeta):
                     
         return result
         
-    def batch_update_tags(self, node_list, operation='add', tags=None, clear_existing=False):
+    def batch_update_tags(self, node_list, operation='add', tags=None, clear_existing=False, max_workers=None):
         """
         批量更新多个节点的标签
         
@@ -5209,6 +7211,7 @@ class ION(metaclass=MLInterceptorMeta):
             operation: 操作类型，'add'(添加)、'remove'(移除)或'set'(设置)
             tags: 要添加、移除或设置的标签，可以是单个标签或标签列表
             clear_existing: 是否清除现有标签(与set操作配合使用)
+            max_workers: 最大工作线程数，None表示使用实例默认值
             
         返回:
             成功更新的节点列表
@@ -5227,15 +7230,15 @@ class ION(metaclass=MLInterceptorMeta):
                 print(f"更新节点 {node} 的标签时出错: {e}")
                 return None
                 
-            return self.parallel_batch_process(node_list, update_tags)
+        return self.parallel_batch_process(node_list, update_tags, max_workers=max_workers)
         
-    def batch_update_weights(self, nodes_weights):
+    def batch_update_weights(self, nodes_weights, max_workers=None):
         """
         批量更新多个节点的权重
         
         参数:
             nodes_weights: [(node, weight), ...] 格式的列表
-            
+            max_workers: 最大工作线程数，None表示使用实例默认值
         返回:
             成功更新的节点列表
         """
@@ -5247,7 +7250,7 @@ class ION(metaclass=MLInterceptorMeta):
                 print(f"更新节点权重时出错: {e}")
                 return None
                 
-        return self.parallel_batch_process(nodes_weights, update_weight)
+        return self.parallel_batch_process(nodes_weights, update_weight, max_workers=max_workers)
     
     def __getstate__(self):
         """自定义序列化行为，排除不可序列化的对象"""
@@ -5451,7 +7454,273 @@ class ION(metaclass=MLInterceptorMeta):
         
         # 如果无法到达目标节点
         return None, float('inf')
-    
+    # 使用示例（可以放在文件末尾或单独的测试文件中）
+    """
+    # 基本过滤
+    def my_filter(node, context, extra_info):
+        return node.weight > 2.0
+
+    results = ion.filter_pro(my_filter)
+
+    # 高级过滤 - 包含评分
+    def scored_filter(node, context, extra_info):
+        score = 0
+        if 'important' in extra_info['tags']:
+            score += 0.5
+        if node.weight > 1.0:
+            score += 0.3
+        if extra_info['relation_count'] > 2:
+            score += 0.2
+        
+        scored_filter.last_score = score  # 设置评分
+        return score > 0.5
+
+    results = ion.filter_pro(
+        scored_filter,
+        include_fields=['tags', 'weight', 'stats'],
+        sort_by='score',
+        sort_reverse=True,
+        max_results=10
+    )
+
+    # 分组过滤
+    def group_filter(node, context, extra_info):
+        return len(extra_info['tags']) > 0
+
+    grouped = ion.filter_pro(
+        group_filter,
+        group_by=lambda node, info: list(info['tags'])[0] if info['tags'] else 'no_tags',
+        return_format='grouped'
+    )
+
+    # 自定义转换
+    def transform_result(node, extra_info):
+        return {
+            'id': node.key,
+            'value': node.val,
+            'importance': node.weight,
+            'connections': extra_info['relation_count']
+        }
+
+    custom_results = ion.filter_pro(
+        lambda n, c, e: True,  # 选择所有节点
+        transform_func=transform_result,
+        max_results=100
+    )
+    """
+    def filter_pro(self, filter_func, 
+               include_fields=None, 
+               exclude_fields=None,
+               max_results=None,
+               parallel=True,
+               max_workers=None,
+               return_format='nodes',
+               sort_by=None,
+               sort_reverse=False,
+               group_by=None,
+               transform_func=None,
+               pre_filter=None,
+               post_filter=None,
+               context=None):
+        """
+        高级过滤函数，提供强大的节点过滤和遍历功能
+        
+        参数:
+            filter_func: 主过滤函数，接收(node, context, extra_info)参数
+            include_fields: 要包含在extra_info中的字段列表 ['key', 'val', 'metadata', 'tags', 'weight', 'relations', 'row', 'stats']
+            exclude_fields: 要排除的字段列表
+            max_results: 最大结果数量，None表示不限制
+            parallel: 是否使用并行处理
+            max_workers: 并行处理的最大工作线程数
+            return_format: 返回格式 'nodes'|'keys'|'values'|'full'|'custom'
+            sort_by: 排序字段或函数
+            sort_reverse: 是否逆序排序
+            group_by: 分组字段或函数
+            transform_func: 结果转换函数
+            pre_filter: 预过滤函数（快速筛选）
+            post_filter: 后过滤函数（结果后处理）
+            context: 传递给过滤函数的上下文信息
+            
+        返回:
+            根据return_format返回不同格式的结果
+        """
+        # 默认包含的字段
+        default_fields = ['key', 'val', 'metadata', 'tags', 'weight', 'relations', 'row']
+        
+        # 处理字段包含/排除逻辑
+        if include_fields is None:
+            active_fields = set(default_fields)
+        else:
+            active_fields = set(include_fields)
+        
+        if exclude_fields:
+            active_fields -= set(exclude_fields)
+        
+        # 初始化上下文
+        if context is None:
+            context = {}
+        
+        # 添加ION实例信息到上下文
+        context.update({
+            'ion_instance': self,
+            'total_nodes': len(self),
+            'filter_timestamp': time.time()
+        })
+        
+        def process_node(node):
+            """处理单个节点"""
+            try:
+                # 预过滤检查
+                if pre_filter and not pre_filter(node, context):
+                    return None
+                
+                # 构建extra_info
+                extra_info = {}
+                
+                if 'key' in active_fields:
+                    extra_info['key'] = node.key
+                if 'val' in active_fields:
+                    extra_info['val'] = node.val
+                if 'metadata' in active_fields:
+                    extra_info['metadata'] = node.metadata
+                if 'tags' in active_fields:
+                    extra_info['tags'] = list(node.tags)
+                if 'weight' in active_fields:
+                    extra_info['weight'] = node.weight
+                if 'relations' in active_fields:
+                    extra_info['relations'] = self._get_relation_info(node)
+                if 'row' in active_fields:
+                    extra_info['row'] = node.row
+                if 'stats' in active_fields:
+                    extra_info['stats'] = self._get_node_stats(node)
+                
+                # 执行主过滤函数
+                if filter_func(node, context, extra_info):
+                    result_data = {
+                        'node': node,
+                        'extra_info': extra_info,
+                        'match_score': getattr(filter_func, 'last_score', 1.0)  # 支持评分
+                    }
+                    
+                    # 后过滤检查
+                    if post_filter:
+                        result_data = post_filter(result_data, context)
+                        if not result_data:
+                            return None
+                    
+                    return result_data
+                
+            except Exception as e:
+                if context.get('debug', False):
+                    print(f"处理节点 {node.key} 时出错: {e}")
+                return None
+            
+            return None
+        
+        # 收集所有节点
+        all_nodes = []
+        for bucket in self.buckets:
+            if bucket:
+                current = bucket
+                while current:
+                    if hasattr(current, 'key'):  # 确保是节点对象
+                        all_nodes.append(current)
+                    current = getattr(current, 'next', None)
+        
+        # 并行或串行处理
+        if parallel and len(all_nodes) > 100:  # 节点数量较多时才使用并行
+            results = self.parallel_batch_process(all_nodes, process_node, max_workers=max_workers)
+        else:
+            results = [process_node(node) for node in all_nodes]
+        
+        # 过滤掉None结果
+        valid_results = [r for r in results if r is not None]
+        
+        # 限制结果数量
+        if max_results and len(valid_results) > max_results:
+            valid_results = valid_results[:max_results]
+        
+        # 排序
+        if sort_by:
+            if callable(sort_by):
+                valid_results.sort(key=lambda x: sort_by(x['node'], x['extra_info']), reverse=sort_reverse)
+            elif isinstance(sort_by, str):
+                if sort_by == 'score':
+                    valid_results.sort(key=lambda x: x['match_score'], reverse=sort_reverse)
+                elif sort_by in ['key', 'weight']:
+                    valid_results.sort(key=lambda x: getattr(x['node'], sort_by), reverse=sort_reverse)
+                elif sort_by in (x['extra_info'] for x in valid_results if x['extra_info']):
+                    valid_results.sort(key=lambda x: x['extra_info'].get(sort_by, 0), reverse=sort_reverse)
+        
+        # 分组
+        if group_by:
+            grouped_results = {}
+            for result in valid_results:
+                if callable(group_by):
+                    group_key = group_by(result['node'], result['extra_info'])
+                else:
+                    group_key = result['extra_info'].get(group_by, 'unknown')
+                
+                if group_key not in grouped_results:
+                    grouped_results[group_key] = []
+                grouped_results[group_key].append(result)
+            
+            # 如果有分组，返回分组结果
+            if return_format == 'grouped':
+                return grouped_results
+        
+        # 结果转换
+        if transform_func:
+            valid_results = [transform_func(r['node'], r['extra_info']) for r in valid_results]
+        else:
+            # 根据return_format处理结果
+            if return_format == 'nodes':
+                valid_results = [r['node'] for r in valid_results]
+            elif return_format == 'keys':
+                valid_results = [r['node'].key for r in valid_results]
+            elif return_format == 'values':
+                valid_results = [r['node'].val for r in valid_results]
+            elif return_format == 'full':
+                # 返回完整信息
+                pass  # valid_results已经包含完整信息
+            elif return_format == 'custom':
+                # 自定义格式，保持原样
+                pass
+        
+        return valid_results
+
+    def _get_relation_info(self, node):
+        """获取节点的关系信息"""
+        if not hasattr(node, 'r') or not node.r:
+            return []
+        
+        relation_info = []
+        for relation in node.r:
+            info = {
+                'target': relation.get('node', relation).key if hasattr(relation.get('node', relation), 'key') else str(relation.get('node', relation)),
+                'type': relation.get('type'),
+                'weight': relation.get('weight', 1.0),
+                'metadata': relation.get('metadata', {})
+            }
+            relation_info.append(info)
+        
+        return relation_info
+
+    def _get_node_stats(self, node):
+        """获取节点的统计信息"""
+        stats = {
+            'relation_count': len(node.r) if hasattr(node, 'r') and node.r else 0,
+            'tag_count': len(node.tags) if hasattr(node, 'tags') else 0,
+            'metadata_count': len(node.metadata) if hasattr(node, 'metadata') and node.metadata else 0,
+            'created_at': getattr(node, '_created_at', None),
+            'updated_at': getattr(node, '_updated_at', None)
+        }
+        
+        # 计算值的大小（如果是字符串或容器）
+        if hasattr(node.val, '__len__'):
+            stats['value_size'] = len(node.val)
+        
+        return stats
     def _reconstruct_path(self, came_from, current):
         """从来源映射中重建完整路径"""
         path = [current]
@@ -5459,7 +7728,19 @@ class ION(metaclass=MLInterceptorMeta):
             current = came_from[current]
             path.append(current)
         path.reverse()  # 反转路径，使其从起点开始
-        return path
+        
+        
+        
+        # 确保返回的是节点对象列表
+        node_path = []
+        for item in path:
+            if hasattr(item, 'key'):  # 已经是节点对象
+                node_path.append(item)
+            else:  # 是键，需要转换为节点对象
+                node = self.get_node_by_key(item)
+            if node:
+                node_path.append(node)
+        return node_path
         
     def astar_search_advanced(self, start, goal, options=None):
         """
@@ -5855,8 +8136,37 @@ class ION(metaclass=MLInterceptorMeta):
             backward_path.reverse()
             
             # 合并路径（不重复添加相遇点）
-            complete_path = forward_path + backward_path[1:]
-            
+            # 改进版本：
+            if forward_path and backward_path:
+                # 如果路径中包含的是键而不是节点对象，需要转换
+                if forward_path and isinstance(forward_path[0], str):
+                    forward_path = [self.get_node_by_key(key) for key in forward_path if self.get_node_by_key(key)]
+                if backward_path and isinstance(backward_path[0], str):
+                    backward_path = [self.get_node_by_key(key) for key in backward_path if self.get_node_by_key(key)]
+                
+                complete_path = forward_path + backward_path[1:]
+            else:
+                complete_path = []
+            # 确保路径中的元素都是节点对象而不是键
+            if complete_path:
+                # 验证路径中的每个元素
+                validated_path = []
+                for item in complete_path:
+                    if hasattr(item, 'key'):  # 是节点对象
+                        validated_path.append(item)
+                    elif isinstance(item, str):  # 是键字符串
+                        node = self.get_node_by_key(item)
+                        if node:
+                            validated_path.append(node)
+                    elif isinstance(item, list):  # 处理嵌套列表的情况
+                        for sub_item in item:
+                            if hasattr(sub_item, 'key'):
+                                validated_path.append(sub_item)
+                            elif isinstance(sub_item, str):
+                                node = self.get_node_by_key(sub_item)
+                                if node:
+                                    validated_path.append(node)
+                complete_path = validated_path
             return complete_path, best_cost, stats
             
         # 没有找到路径
@@ -5891,22 +8201,13 @@ class ION(metaclass=MLInterceptorMeta):
             
         # 触发事件
         self._trigger_event('transaction_started', transaction=transaction)
-        
         return transaction
     
     def commit_transaction(self, transaction_id):
-        """
-        提交指定事务
+        """提交指定事务"""
         
-        参数:
-            transaction_id: 要提交的事务ID
-            
-        返回:
-            bool: 是否成功提交
-            
-        异常:
-            TransactionError: 如果事务不存在或无法提交
-        """
+        # 先获取事务对象，但不立即删除
+        transaction = None
         with self.lock:
             if transaction_id not in self.active_transactions:
                 raise TransactionError(f"事务不存在: {transaction_id}")
@@ -5916,7 +8217,7 @@ class ION(metaclass=MLInterceptorMeta):
         # 提交事务
         result = transaction.commit()
         
-        # 清理
+        # 提交成功后再清理
         with self.lock:
             if transaction_id in self.active_transactions:
                 del self.active_transactions[transaction_id]
@@ -6186,7 +8487,7 @@ class ION(metaclass=MLInterceptorMeta):
     
     # ---- 创建具有事务支持的节点操作 ----
     
-    def create_node_in_transaction(self, txn_id, key, val, metadata=None, tags=None, weight=1.0):
+    def create_node_in_transaction(self, txn_id, key, val, metadata=None, tags=None, weight=1.0, row=None, val_locker=None):
         """
         在事务中创建节点
         
@@ -6197,6 +8498,8 @@ class ION(metaclass=MLInterceptorMeta):
             metadata: 元数据
             tags: 标签
             weight: 权重
+            row: 行
+            val_locker: 值锁函数
             
         返回:
             创建的节点
@@ -6211,7 +8514,7 @@ class ION(metaclass=MLInterceptorMeta):
             self.acquire_write_lock(txn_id, key, transaction.timeout)
             
                     # 创建节点
-        node = self.create_node(key, val, metadata, tags, weight)
+        node = self.create_node(key, val, metadata, tags, weight, row, val_locker)
         
         # 记录日志
         transaction.add_log_entry(
@@ -6219,7 +8522,7 @@ class ION(metaclass=MLInterceptorMeta):
             node_key=key, 
             new_value=val, 
             metadata=metadata, 
-            tags=tags if tags else None
+            tags=tags if tags else None,
         )
         
         # 更新版本号
@@ -8765,7 +11068,19 @@ class ION(metaclass=MLInterceptorMeta):
                 context={'field': 'row'}
             )
         return node
-
+    def update_node_val_locker(self, node, new_val_locker):
+        """更新节点的值锁"""
+        old_val_locker = node._val_locker
+        node._val_locker = new_val_locker
+        if self.enable_sync:
+            self._trigger_sync_event(
+                SyncOperation.UPDATE,
+                node=node,
+                old_value=old_val_locker,
+                new_value=new_val_locker,
+                context={'field': 'val_locker'}
+            )
+        return node
     def find_nodes_by_row(self, row_id):
         """根据行标识查找节点"""
         if row_id is None:
@@ -8842,26 +11157,102 @@ class ION(metaclass=MLInterceptorMeta):
                     break
         return results
 
-    def batch_create_table_nodes(self, table_data, table_name=None):
+    def batch_create_table_nodes(self, table_data, table_name=None, max_workers=None):
         """
         批量创建节点并可自动生成表视图
-        table_data: [{'row': row_id, 'columns': {col: val}}]
+        
+        参数:
+            table_data: [{'row': row_id, 'columns': {col: val}}] 格式的数据
+            table_name: 表名，如果提供则创建表视图
+            max_workers: 最大工作线程数，None表示使用实例默认值
+            
+        返回:
+            创建的节点列表
         """
-        created, mapping = [], {}
-        for item in table_data:
-            row_id, cols = item.get('row'), item.get('columns', {})
-            if table_name:
-                mapping.setdefault(row_id, {})
-            for col, val in cols.items():
-                key = f"{table_name}_{row_id}_{col}" if table_name else f"{row_id}_{col}"
-                node = self.create_node(key=key, val=val,
-                                        metadata={'table': table_name, 'column': col},
-                                        row=row_id)
-                created.append(node)
+        def create_table_node(item):
+            
+            # 处理不同的输入格式
+            if isinstance(item, dict):
+                # 字典格式：使用id作为key，整个字典作为row
+                key = item.get('id', f"row_{len(item)}")
+                val = item.get('name', str(item))
+                row = item
+                metadata = {'table': table_name} if table_name else {}
+                
+                # 创建节点
+                node = self.create_node(
+                    key=key,
+                    val=val,
+                    row=row,
+                    metadata=metadata
+                )
+                # 返回正确的格式
+                return {
+                    'row_id': key,
+                    'nodes': [node]
+                }
+            elif isinstance(item, (list, tuple)):
+                # 列表/元组格式：第一个元素作为key
+                key = item[0] if len(item) > 0 else f"row_{hash(str(item))}"
+                val = item[1] if len(item) > 1 else str(item)
+                row = dict(enumerate(item))  # 转换为字典格式
+                metadata = {'table': table_name} if table_name else {}
+                
+                node = self.create_node(
+                    key=key,
+                    val=val,
+                    row=row,
+                    metadata=metadata
+                )
+                return {
+                    'row_id': key,
+                    'nodes': [node]
+                }
+            elif isinstance(item, str):
+                # 处理字符串格式
+                key = item
+                val = None
+                row = {'value': item, 'original_type': type(item).__name__}
+                
+                node = self.create_node(
+                    key=key,
+                    val=val,
+                    row=row,
+                    metadata={'table': table_name} if table_name else {}
+                )
+                return {
+                    'row_id': key,
+                    'nodes': [node]
+                }
+            
+            # 如果无法处理，返回None
+                return None
+        
+        # 并行创建节点
+        results = self.parallel_batch_process(table_data, create_table_node, max_workers=max_workers)
+        
+        # 收集所有创建的节点和映射
+        created = []
+        mapping = {}
+        
+        for result in results:
+            if result:
+                row_id = result['row_id']
+                nodes = result['nodes']
+                created.extend(nodes)
+                
                 if table_name:
-                    mapping[row_id][col] = key
+                    mapping.setdefault(row_id, {})
+                    for node in nodes:
+                        # 从节点的metadata中提取列名
+                        col = node.metadata.get('column')
+                        if col:
+                            mapping[row_id][col] = node.key
+        
+        # 创建表视图
         if table_name and mapping:
             self.create_table_view(table_name, mapping)
+            
         return created
 
     def get_table_stats(self, table_name=None):
@@ -9412,12 +11803,555 @@ class ION(metaclass=MLInterceptorMeta):
             """清除机器学习数据"""
             if hasattr(self, 'ml_engine'):
                 self.ml_engine.clear_learning_data()
-    
+    @classmethod
+    def make_type_locker(cls,allowed_types):
+        """创建类型限制的值锁"""
+        if isinstance(allowed_types, type):
+            allowed_types = (allowed_types,)
+        elif isinstance(allowed_types, list):
+            allowed_types = tuple(allowed_types)
+        def type_locker(value, attribute_type):
+            if attribute_type==cls.IONNode.VAL:
+                return not isinstance(value, allowed_types)
+            return True
+        return type_locker
+    @classmethod
+    def make_range_locker(cls,min_val=None, max_val=None):
+        """创建数值范围限制的值锁"""
+        def range_locker(value, attribute_type):
+            if attribute_type==cls.IONNode.VAL:
+                try:
+                    if min_val is not None and value < min_val:
+                        return True
+                    if max_val is not None and value > max_val:
+                        return True
+                    return False
+                except (TypeError, ValueError):
+                    return True  # 无法比较的类型拒绝
+            return True
+        return range_locker
+    @classmethod
+    def make_pattern_locker(cls,pattern):
+        """创建正则表达式模式限制的值锁"""
+        import re
+        compiled_pattern = re.compile(pattern)
+        def pattern_locker(value, attribute_type):
+            if attribute_type==cls.IONNode.VAL:
+                try:
+                    return not bool(compiled_pattern.match(str(value)))
+                except:
+                    return True
+            return True
+        return pattern_locker
+    @classmethod
+    def make_length_locker(cls,min_length=None, max_length=None):
+        """创建长度限制的值锁"""
+        def length_locker(value, attribute_type):
+            if attribute_type==cls.IONNode.VAL:
+                try:
+                    length = len(value)
+                    if min_length is not None and length < min_length:
+                        return True
+                    if max_length is not None and length > max_length:
+                        return True
+                    return False
+                except:
+                    return True
+            return True
+        return length_locker
+    @classmethod
+    def make_custom_locker(cls,validator_func):
+        """创建自定义验证器的值锁"""
+        def custom_locker(value, attribute_type):
+            if attribute_type==cls.IONNode.VAL:
+                try:
+                    return not validator_func(value)
+                except:
+                    return True
+            return True
+        return custom_locker
+    @classmethod
+    def make_enum_locker(cls,allowed_values):
+        """创建枚举值限制的值锁"""
+        if isinstance(allowed_values, (list, tuple)):
+            allowed_values = set(allowed_values)
+        def enum_locker(value, attribute_type):
+            if attribute_type==cls.IONNode.VAL:
+                return value not in allowed_values
+            return True
+        return enum_locker
+    @classmethod
+    def make_metadata_locker(cls,allowed_keys=None, key_validators=None):
+        """创建元数据锁"""
+        def metadata_locker(metadata, attribute_type):
+            if attribute_type==cls.IONNode.METADATA:
+                if not isinstance(metadata, dict):
+                    return True  # 拒绝非字典类型
+                
+                if allowed_keys is not None:
+                    for key in metadata.keys():
+                        if key not in allowed_keys:
+                            return True  # 拒绝不允许的键
+                
+                if key_validators is not None:
+                    for key, validator in key_validators.items():
+                        if key in metadata:
+                            if validator(metadata[key]):
+                                return True  # 拒绝不符合验证器的值
+            
+            return False
+        return metadata_locker
+
+    @classmethod
+    def make_tag_locker(cls,allowed_tags=None, tag_pattern=None):
+        """创建标签锁"""
+        def tag_locker(tag, attribute_type):
+            if attribute_type==cls.IONNode.TAG:
+                if allowed_tags is not None:
+                    if tag not in allowed_tags:
+                        return True  # 拒绝不允许的标签
+            
+                if tag_pattern is not None:
+                    import re
+                    if not re.match(tag_pattern, str(tag)):
+                        return True  # 拒绝不匹配模式的标签
+                
+                return False
+            return True
+        return tag_locker
+
+    @classmethod
+    def make_weight_locker(cls,min_weight=None, max_weight=None):
+        """创建权重锁"""
+        def weight_locker(weight, attribute_type):
+            if attribute_type==cls.IONNode.WEIGHT:
+                try:
+                    weight = float(weight)
+                    if min_weight is not None and weight < min_weight:
+                        return True
+                    if max_weight is not None and weight > max_weight:
+                        return True
+                    return False
+                except (TypeError, ValueError):
+                    return True  # 拒绝无法转换为浮点数的值
+            return True
+        return weight_locker
+
+    @classmethod
+    def make_row_locker(cls,allowed_patterns=None, row_validator=None):
+        """创建行标识锁"""
+        def row_locker(row_id, attribute_type):
+            if attribute_type==cls.IONNode.ROW:
+                if allowed_patterns is not None:
+                    import re
+                    for pattern in allowed_patterns:
+                        if re.match(pattern, str(row_id)):
+                            break
+                    else:
+                        return True  # 拒绝不匹配任何模式的行标识
+                
+                if row_validator is not None:
+                    if row_validator(row_id):
+                        return True  # 拒绝不符合自定义验证器的行标识
+            
+            return False
+        return row_locker
+    @classmethod
+    def make_relation_locker(cls,allowed_types=None, node_validator=None, weight_range=None, metadata_validator=None):
+        """创建关系锁"""
+        def relation_locker(relation_data, attribute_type):
+            if attribute_type == cls.IONNode.RELATION:
+                if not isinstance(relation_data, dict):
+                    return True  # 拒绝非字典类型的关系数据
+                
+                # 验证关系类型
+                if allowed_types is not None:
+                    rel_type = relation_data.get('type')
+                    if rel_type not in allowed_types:
+                        return True  # 拒绝不允许的关系类型
+                
+                # 验证节点
+                if node_validator is not None:
+                    node = relation_data.get('node')
+                    if node_validator(node):
+                        return True  # 拒绝不符合验证器的节点
+                
+                # 验证权重范围
+                if weight_range is not None:
+                    weight = relation_data.get('weight', 1.0)
+                    min_weight, max_weight = weight_range
+                    try:
+                        weight = float(weight)
+                        if min_weight is not None and weight < min_weight:
+                            return True
+                        if max_weight is not None and weight > max_weight:
+                            return True
+                    except (TypeError, ValueError):
+                        return True
+                
+                # 验证元数据
+                if metadata_validator is not None:
+                    metadata = relation_data.get('metadata')
+                    if metadata is not None and metadata_validator(metadata):
+                        return True  # 拒绝不符合验证器的元数据
+                
+                return False
+            return True
+        return relation_locker
 # ===========特殊方法=============
 import subprocess
 import os
 def system(file=None):
     if file is None:
-        os.system(f'python3 /Users/$(whoami)/$(cat /usr/local/cpl/cpl_pathset)')
+        os.system(f'python3 /Users/$(whoami)/$(cat ~/cpl/cpl_pathset)')
     else:
         subprocess.run(['python3','app_ion.py',file])
+# 添加B-tree支持
+class BTreeNode(ION.IONNode):
+        """B-tree节点类，继承IONNode获得完整的图数据库功能"""
+        
+        def __init__(self, key, val=None, metadata=None, tags=None, weight=1.0, 
+                    row=None, val_locker=None, order=128, is_leaf=False):
+            # 调用父类构造函数，获得所有IONNode功能
+            super().__init__(key, val, metadata, tags, weight, row, val_locker)
+            
+            # B-tree特有属性
+            self.order = order
+            self.is_leaf = is_leaf
+            self.keys = []  # B-tree键列表
+            self.btree_values = []  # B-tree值列表（区别于IONNode的val）
+            self.children = []  # 子节点列表
+            self.parent = None
+            self.next_leaf = None  # 叶子节点链表
+            
+            # 现在BTreeNode自动拥有：
+            # - self.r (关系字典)
+            # - self.val_locker (值锁定器)
+            # - self.metadata (元数据)
+            # - self.tags (标签集合)
+            # - 所有IONNode的方法
+        @property
+        def values(self):
+            return self.btree_values
+        def is_full(self):
+            return len(self.keys) >= self.order - 1
+            
+        def is_underflow(self):
+            return len(self.keys) < (self.order - 1) // 2
+            
+        def find_key_index(self, key):
+            """查找键应该插入的位置"""
+            for i, k in enumerate(self.keys):
+                if key <= k:
+                    return i
+            return len(self.keys)
+        
+        # 现在可以使用IONNode的所有功能：
+        def add_btree_relation(self, other_btree_node, rel_type="btree_child"):
+            """添加B-tree节点间的关系"""
+            self.add_relation(other_btree_node, rel_type)
+        
+        def get_btree_metadata(self):
+            """获取B-tree特定的元数据"""
+            btree_meta = {
+                "order": self.order,
+                "is_leaf": self.is_leaf,
+                "keys_count": len(self.keys),
+                "children_count": len(self.children)
+            }
+            # 合并IONNode的元数据
+            if self.metadata:
+                btree_meta.update(self.metadata)
+            return btree_meta
+        def __repr__(self):
+            return f"BTreeNode(key={self.key}, val={self.val}, relations={len(self.r)})"
+class BTreeIndex:
+        """B-tree索引类"""
+        def __init__(self, order=128):
+            self.order = order
+            self.root = BTreeNode(order, is_leaf=True)
+            self.lock = threading.RLock()
+            
+        def insert(self, key, value):
+            """插入键值对"""
+            with self.lock:
+                if self.root.is_full():
+                    # 根节点分裂
+                    new_root = BTreeNode(self.order)
+                    new_root.children.append(self.root)
+                    self.root.parent = new_root
+                    self._split_child(new_root, 0)
+                    self.root = new_root
+                
+                self._insert_non_full(self.root, key, value)
+        
+        def _insert_non_full(self, node, key, value):
+            """在非满节点中插入"""
+            i = node.find_key_index(key)
+            
+            if node.is_leaf:
+                # 叶子节点直接插入
+                if i < len(node.keys) and node.keys[i] == key:
+                    # 键已存在，添加到值列表
+                    if not isinstance(node.values[i], list):
+                        node.values[i] = [node.values[i]]
+                    node.values[i].append(value)
+                else:
+                    # 插入新键值对
+                    node.keys.insert(i, key)
+                    node.values.insert(i, [value])
+            else:
+                # 内部节点
+                child = node.children[i]
+                if child.is_full():
+                    self._split_child(node, i)
+                    if key > node.keys[i]:
+                        i += 1
+                self._insert_non_full(node.children[i], key, value)
+        
+        def _split_child(self, parent, index):
+            """分裂子节点"""
+            full_child = parent.children[index]
+            new_child = BTreeNode(self.order, full_child.is_leaf)
+            
+            mid = (self.order - 1) // 2
+            
+            # 移动键和值
+            new_child.keys = full_child.keys[mid + 1:]
+            full_child.keys = full_child.keys[:mid]
+            
+            if full_child.is_leaf:
+                new_child.values = full_child.values[mid + 1:]
+                full_child.values = full_child.values[:mid]
+                # 维护叶子节点链表
+                new_child.next_leaf = full_child.next_leaf
+                full_child.next_leaf = new_child
+            else:
+                new_child.values = full_child.values[mid + 1:]
+                full_child.values = full_child.values[:mid]
+                new_child.children = full_child.children[mid + 1:]
+                full_child.children = full_child.children[:mid + 1]
+                
+                # 更新父节点引用
+                for child in new_child.children:
+                    child.parent = new_child
+            
+            # 提升中间键到父节点
+            parent.keys.insert(index, full_child.keys[mid])
+            parent.values.insert(index, None)  # 内部节点值为None
+            parent.children.insert(index + 1, new_child)
+            
+            new_child.parent = parent
+        
+        def search(self, key):
+            """搜索键对应的值"""
+            with self.lock:
+                return self._search_node(self.root, key)
+        
+        def _search_node(self, node, key):
+            """在节点中搜索"""
+            i = 0
+            while i < len(node.keys) and key > node.keys[i]:
+                i += 1
+            
+            if i < len(node.keys) and key == node.keys[i]:
+                if node.is_leaf:
+                    return node.values[i]
+                else:
+                    # 内部节点继续搜索
+                    return self._search_node(node.children[i + 1], key)
+            elif node.is_leaf:
+                return []
+            else:
+                return self._search_node(node.children[i], key)
+        
+        def range_search(self, start_key, end_key):
+            """范围搜索"""
+            with self.lock:
+                result = []
+                leaf = self._find_leaf(self.root, start_key)
+                
+                while leaf:
+                    for i, key in enumerate(leaf.keys):
+                        if start_key <= key <= end_key:
+                            result.extend(leaf.values[i] if isinstance(leaf.values[i], list) else [leaf.values[i]])
+                        elif key > end_key:
+                            return result
+                    leaf = leaf.next_leaf
+                
+                return result
+        
+        def _find_leaf(self, node, key):
+            """找到包含键的叶子节点"""
+            while not node.is_leaf:
+                i = node.find_key_index(key)
+                node = node.children[i]
+            return node
+        
+        def delete(self, key, value=None):
+            """删除键值对"""
+            with self.lock:
+                self._delete_from_node(self.root, key, value)
+                
+                # 如果根节点为空且有子节点，更新根节点
+                if not self.root.keys and self.root.children:
+                    self.root = self.root.children[0]
+                    self.root.parent = None
+        
+        def _delete_from_node(self, node, key, value):
+            """从节点删除键值对"""
+            i = node.find_key_index(key)
+            
+            if i < len(node.keys) and node.keys[i] == key:
+                if node.is_leaf:
+                    if value is None:
+                        # 删除整个键
+                        node.keys.pop(i)
+                        node.values.pop(i)
+                    else:
+                        # 删除特定值
+                        if isinstance(node.values[i], list):
+                            if value in node.values[i]:
+                                node.values[i].remove(value)
+                            if not node.values[i]:
+                                node.keys.pop(i)
+                                node.values.pop(i)
+                else:
+                    # 内部节点删除逻辑
+                    self._delete_internal_key(node, i)
+            elif not node.is_leaf:
+                # 继续在子节点中删除
+                child = node.children[i]
+                self._delete_from_node(child, key, value)
+                
+                # 检查子节点是否需要重平衡
+                if child.is_underflow():
+                    self._fix_underflow(node, i)
+        
+        def _delete_internal_key(self, node, index):
+            """删除内部节点的键"""
+            key = node.keys[index]
+            left_child = node.children[index]
+            right_child = node.children[index + 1]
+            
+            if len(left_child.keys) >= (self.order + 1) // 2:
+                # 从左子树找前驱
+                predecessor = self._get_predecessor(left_child)
+                node.keys[index] = predecessor
+                self._delete_from_node(left_child, predecessor, None)
+            elif len(right_child.keys) >= (self.order + 1) // 2:
+                # 从右子树找后继
+                successor = self._get_successor(right_child)
+                node.keys[index] = successor
+                self._delete_from_node(right_child, successor, None)
+            else:
+                # 合并子节点
+                self._merge_children(node, index)
+                self._delete_from_node(left_child, key, None)
+        
+        def _get_predecessor(self, node):
+            """获取前驱键"""
+            while not node.is_leaf:
+                node = node.children[-1]
+            return node.keys[-1]
+        
+        def _get_successor(self, node):
+            """获取后继键"""
+            while not node.is_leaf:
+                node = node.children[0]
+            return node.keys[0]
+        
+        def _fix_underflow(self, parent, child_index):
+            """修复下溢"""
+            child = parent.children[child_index]
+            
+            # 尝试从左兄弟借键
+            if child_index > 0:
+                left_sibling = parent.children[child_index - 1]
+                if len(left_sibling.keys) > (self.order - 1) // 2:
+                    self._borrow_from_left(parent, child_index)
+                    return
+            
+            # 尝试从右兄弟借键
+            if child_index < len(parent.children) - 1:
+                right_sibling = parent.children[child_index + 1]
+                if len(right_sibling.keys) > (self.order - 1) // 2:
+                    self._borrow_from_right(parent, child_index)
+                    return
+            
+            # 合并节点
+            if child_index > 0:
+                self._merge_children(parent, child_index - 1)
+            else:
+                self._merge_children(parent, child_index)
+        
+        def _borrow_from_left(self, parent, child_index):
+            """从左兄弟借键"""
+            child = parent.children[child_index]
+            left_sibling = parent.children[child_index - 1]
+            
+            # 移动父节点的键到子节点
+            child.keys.insert(0, parent.keys[child_index - 1])
+            parent.keys[child_index - 1] = left_sibling.keys.pop()
+            
+            if child.is_leaf:
+                child.values.insert(0, left_sibling.values.pop())
+            else:
+                child.values.insert(0, None)
+                child.children.insert(0, left_sibling.children.pop())
+                child.children[0].parent = child
+        
+        def _borrow_from_right(self, parent, child_index):
+            """从右兄弟借键"""
+            child = parent.children[child_index]
+            right_sibling = parent.children[child_index + 1]
+            
+            # 移动父节点的键到子节点
+            child.keys.append(parent.keys[child_index])
+            parent.keys[child_index] = right_sibling.keys.pop(0)
+            
+            if child.is_leaf:
+                child.values.append(right_sibling.values.pop(0))
+            else:
+                child.values.append(None)
+                child.children.append(right_sibling.children.pop(0))
+                child.children[-1].parent = child
+        
+        def _merge_children(self, parent, index):
+            """合并子节点"""
+            left_child = parent.children[index]
+            right_child = parent.children[index + 1]
+            
+            # 将父节点的键和右子节点合并到左子节点
+            left_child.keys.append(parent.keys[index])
+            left_child.keys.extend(right_child.keys)
+            
+            if left_child.is_leaf:
+                left_child.values.extend(right_child.values)
+                left_child.next_leaf = right_child.next_leaf
+            else:
+                left_child.values.append(None)
+                left_child.values.extend(right_child.values)
+                left_child.children.extend(right_child.children)
+                for child in right_child.children:
+                    child.parent = left_child
+            
+            # 从父节点删除键和右子节点
+            parent.keys.pop(index)
+            parent.values.pop(index)
+            parent.children.pop(index + 1)
+        
+        def get_stats(self):
+            """获取B-tree统计信息"""
+            def count_nodes(node, level=0):
+                stats = {'nodes': 1, 'keys': len(node.keys), 'max_level': level}
+                if not node.is_leaf:
+                    for child in node.children:
+                        child_stats = count_nodes(child, level + 1)
+                        stats['nodes'] += child_stats['nodes']
+                        stats['keys'] += child_stats['keys']
+                        stats['max_level'] = max(stats['max_level'], child_stats['max_level'])
+                return stats
+            
+            with self.lock:
+                return count_nodes(self.root)
