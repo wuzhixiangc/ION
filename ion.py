@@ -3,11 +3,30 @@
 """
 IntegratedObjectNetwork (ION) - 结合OND和ICombinedDataStructure的高级数据结构
 """
+import sys
+import json
+import os
+if os.path.exists("config.json"):
+    with open("config.json","r") as f:
+        config=json.load(f)
+else:
+    config={
+        "path":"/Users/wuzhixiang/hahhaha",
+        "version":"0.8.4",
+        "ion_proj_path":"???"
+    }
+if config.get("path"):
+    sys.path.append(config["path"])
+if config.get("ion_proj_path") is not "???":
+    sys.path.append(config["path"])
+__version__="0.8.4"
+if __version__!=config.get("version"):
+    print(f"Warning: You are using an outdated version of ion.py. Please update to the latest version. (Current version: {__version__}, your version: {config.get('version')}) Lastest version: 0.8.4")
+
 import hashlib
 import pickle
 import threading
 import concurrent.futures
-import json
 import base64
 import os
 import re
@@ -57,7 +76,8 @@ try:
     QueryBuilder, SplitStrategy, MergeStrategy
     )
     import ion
-    
+    from ionbraintree import BrainTree,BNode as BrainTreeNode
+    from t import AsyncTaskTeam,AsyncTask,AsyncTaskPoolMixin
     MBTREE_AVAILABLE = True
 except ImportError:
     MBTREE_AVAILABLE = False
@@ -282,6 +302,11 @@ class MLInterceptorMeta(type):
 
                 # 在 ml_wrapped_method 中调用
                 handle_mbtree_indexing(method_name, args, kwargs, result)
+                try:
+                    import __init_ion_other__
+                    __init_ion_other__.init_ion_handle()
+                except (ImportError,ModuleNotFoundError):
+                    pass
             except Exception as e:
                 execution_time = time.time() - start_time
                 # 记录失败的操作
@@ -2697,7 +2722,11 @@ class MBTreeMixin:
         if not nodes:
             return 0 if aggregate_func in ['sum', 'count'] else None
         
-        # 提取值
+        # 对于count聚合，直接统计节点数量
+        if aggregate_func == 'count' and not group_by:
+            return len(nodes)
+        
+        # 提取值（排除None值，除了count操作）
         values = [node.val for node in nodes if node.val is not None]
         
         if group_by:
@@ -2711,13 +2740,19 @@ class MBTreeMixin:
                     group_key = getattr(node, group_by, None)
                 
                 if group_key not in groups:
-                    groups[group_key] = []
-                groups[group_key].append(node.val)
+                    groups[group_key] = {'nodes': [], 'values': []}
+                groups[group_key]['nodes'].append(node)
+                groups[group_key]['values'].append(node.val)
             
             # 对每个组执行聚合
             result = {}
-            for group_key, group_values in groups.items():
-                result[group_key] = self._apply_aggregate_function(group_values, aggregate_func)
+            for group_key, group_data in groups.items():
+                if aggregate_func == 'count':
+                    result[group_key] = len(group_data['nodes'])
+                else:
+                    # 过滤None值用于其他聚合操作
+                    non_none_values = [val for val in group_data['values'] if val is not None]
+                    result[group_key] = self._apply_aggregate_function(non_none_values, aggregate_func)
             
             return result
         else:
@@ -2731,15 +2766,33 @@ class MBTreeMixin:
         
         if isinstance(aggregate_func, str):
             if aggregate_func == 'sum':
-                return sum(values)
+                # 只对数值类型进行求和
+                numeric_values = [v for v in values if isinstance(v, (int, float))]
+                return sum(numeric_values) if numeric_values else 0
             elif aggregate_func == 'avg':
-                return sum(values) / len(values)
+                # 只对数值类型进行平均
+                numeric_values = [v for v in values if isinstance(v, (int, float))]
+                return sum(numeric_values) / len(numeric_values) if numeric_values else None
             elif aggregate_func == 'count':
                 return len(values)
             elif aggregate_func == 'min':
-                return min(values)
+                try:
+                    return min(values)
+                except TypeError:
+                    # 如果类型不兼容，尝试按类型分组
+                    numeric_values = [v for v in values if isinstance(v, (int, float))]
+                    if numeric_values:
+                        return min(numeric_values)
+                    return None
             elif aggregate_func == 'max':
-                return max(values)
+                try:
+                    return max(values)
+                except TypeError:
+                    # 如果类型不兼容，尝试按类型分组
+                    numeric_values = [v for v in values if isinstance(v, (int, float))]
+                    if numeric_values:
+                        return max(numeric_values)
+                    return None
             else:
                 raise ValueError(f"未知的聚合函数: {aggregate_func}")
         elif callable(aggregate_func):
@@ -3754,7 +3807,79 @@ class MBTreeMixin:
             kwargs['index_name'] = 'value_index'
         
         return self.mbtree_manager.bquery(*args,**kwargs)
+    # ========== 投影相关的便捷方法 ==========
 
+    def register_projection_scheme(self, scheme):
+        """注册投影方案"""
+        if not hasattr(self, 'mbtree_manager'):
+            self.init_mbtree_support()
+        return self.mbtree_manager.register_projection_scheme(scheme)
+
+    def unregister_projection_scheme(self, scheme_name: str):
+        """注销投影方案"""
+        if not hasattr(self, 'mbtree_manager'):
+            return False
+        return self.mbtree_manager.unregister_projection_scheme(scheme_name)
+
+    def query_by_projection(self, scheme_name: str, projected_value: Any, index_name: str = None):
+        """通过投影查询"""
+        if not hasattr(self, 'mbtree_manager'):
+            return []
+        return self.mbtree_manager.query_by_projection(scheme_name, projected_value, index_name)
+
+    def create_projection_plane(self, plane_name: str, enable_smart_indexing: bool = True, index_name: str = None):
+        """创建投影平面"""
+        if not hasattr(self, 'mbtree_manager'):
+            self.init_mbtree_support()
+        return self.mbtree_manager.create_projection_plane(plane_name, enable_smart_indexing, index_name)
+
+    def get_mbtree_projection_stats(self, scheme_name: str = None, index_name: str = None):
+        """获取MBTree投影统计"""
+        if not hasattr(self, 'mbtree_manager'):
+            return {}
+        
+        if scheme_name:
+            return self.mbtree_manager.get_projection_stats(scheme_name, index_name)
+        else:
+            # 返回所有投影平面的统计
+            return self.mbtree_manager.get_all_projection_planes_stats(index_name)
+
+    def create_range_projection(self, scheme_name: str, ranges: List[Tuple], field_name: str = 'value'):
+        """创建范围投影方案"""
+        if not MBTREE_AVAILABLE:
+            return False
+        
+        from mbtree import RangeProjection
+        scheme = RangeProjection(scheme_name, ranges, field_name)
+        return self.register_projection_scheme(scheme)
+
+    def create_category_projection(self, scheme_name: str, mapping: Dict[Any, str], 
+                                default_category: str = "other", field_name: str = 'value'):
+        """创建分类投影方案"""
+        if not MBTREE_AVAILABLE:
+            return False
+        
+        from mbtree import CategoryProjection
+        scheme = CategoryProjection(scheme_name, mapping, default_category, field_name)
+        return self.register_projection_scheme(scheme)
+
+    def create_date_projection(self, scheme_name: str, granularity: str = "month", field_name: str = "date"):
+        """创建日期投影方案"""
+        if not MBTREE_AVAILABLE:
+            return False
+        
+        from mbtree import DateProjection
+        scheme = DateProjection(scheme_name, granularity, field_name)
+        return self.register_projection_scheme(scheme)
+
+    def create_function_projection(self, scheme_name: str, projection_func: Callable, field_name: str = 'value'):
+        """创建函数投影方案"""
+        if not MBTREE_AVAILABLE:
+            return False
+        
+        from mbtree import FunctionProjection
+        scheme = FunctionProjection(scheme_name, projection_func, field_name)
+        return self.register_projection_scheme(scheme)
 class QuickBuildMixin:
     def q_empty_table(self,rows:list,cols:list,table_name:str,max_workers:int=None):
         """
@@ -3791,8 +3916,13 @@ class QuickBuildMixin:
         """
         快速索引MBTree
         """
-        
-class ION(BTreeMixin,MBTreeMixin,metaclass=MLInterceptorMeta):
+class Mixin:pass
+try:
+    from __init_ion_other__ import IONMixin
+    Mixin=IONMixin
+except (ImportError,ModuleNotFoundError):
+    pass
+class ION(BTreeMixin,MBTreeMixin,Mixin,AsyncTaskPoolMixin,metaclass=MLInterceptorMeta):
     """
     IntegratedObjectNetwork类 - 整合OND和ICombinedDataStructure的功能
     提供更高级的对象网络结构和操作能力
@@ -5165,6 +5295,400 @@ class ION(BTreeMixin,MBTreeMixin,metaclass=MLInterceptorMeta):
             except Exception as e:
                 logging.error(f"MBTree条件查询失败: {e}")
                 return []
+        # ========== 投影方案管理 ==========
+
+        def register_projection_scheme(self, scheme):
+            """注册投影方案到所有MBTree索引"""
+            if not MBTREE_AVAILABLE:
+                raise ImportError("mbtree模块不可用")
+            
+            with self.lock:
+                success_count = 0
+                for index_name, mbtree_info in self.mbtree_indices.items():
+                    try:
+                        mbtree_info['index'].register_projection_scheme(scheme)
+                        success_count += 1
+                    except Exception as e:
+                        logging.error(f"在索引 '{index_name}' 注册投影方案失败: {e}")
+                
+                return success_count == len(self.mbtree_indices)
+
+        def unregister_projection_scheme(self, scheme_name: str):
+            """从所有MBTree索引注销投影方案"""
+            with self.lock:
+                success_count = 0
+                for index_name, mbtree_info in self.mbtree_indices.items():
+                    try:
+                        mbtree_info['index'].unregister_projection_scheme(scheme_name)
+                        success_count += 1
+                    except Exception as e:
+                        logging.error(f"在索引 '{index_name}' 注销投影方案失败: {e}")
+                
+                return success_count > 0
+
+        def list_projection_schemes(self, index_name=None):
+            """列出投影方案"""
+            if index_name:
+                if index_name in self.mbtree_indices:
+                    return self.mbtree_indices[index_name]['index'].get_all_projection_schemes()
+            else:
+                # 返回第一个索引的投影方案（假设所有索引的投影方案相同）
+                if self.mbtree_indices:
+                    first_index = next(iter(self.mbtree_indices.values()))
+                    return first_index['index'].get_all_projection_schemes()
+            return []
+
+        def rebuild_projections(self, scheme_name: str = None, index_name: str = None):
+            """重建投影"""
+            total_rebuilt = 0
+            
+            with self.lock:
+                if index_name and index_name in self.mbtree_indices:
+                    # 重建特定索引的投影
+                    try:
+                        total_rebuilt = self.mbtree_indices[index_name]['index'].rebuild_projections(scheme_name)
+                    except Exception as e:
+                        logging.error(f"重建索引 '{index_name}' 投影失败: {e}")
+                else:
+                    # 重建所有索引的投影
+                    for name, mbtree_info in self.mbtree_indices.items():
+                        try:
+                            total_rebuilt += mbtree_info['index'].rebuild_projections(scheme_name)
+                        except Exception as e:
+                            logging.error(f"重建索引 '{name}' 投影失败: {e}")
+            
+            return total_rebuilt
+
+        def query_by_projection(self, scheme_name: str, projected_value: Any, index_name: str = None):
+            """通过投影查询"""
+            results = []
+            
+            with self.lock:
+                if index_name and index_name in self.mbtree_indices:
+                    # 在特定索引中查询
+                    try:
+                        tree_results = self.mbtree_indices[index_name]['index'].query_by_projection(scheme_name, projected_value)
+                        for key, value in tree_results:
+                            if hasattr(value, '__iter__') and not isinstance(value, str):
+                                results.extend(value)
+                            else:
+                                results.append(value)
+                    except Exception as e:
+                        logging.error(f"在索引 '{index_name}' 投影查询失败: {e}")
+                else:
+                    # 在所有索引中查询
+                    for name, mbtree_info in self.mbtree_indices.items():
+                        try:
+                            tree_results = mbtree_info['index'].query_by_projection(scheme_name, projected_value)
+                            for key, value in tree_results:
+                                if hasattr(value, '__iter__') and not isinstance(value, str):
+                                    results.extend(value)
+                                else:
+                                    results.append(value)
+                        except Exception as e:
+                            logging.error(f"在索引 '{name}' 投影查询失败: {e}")
+            
+            return results
+
+        def get_projection_stats(self, scheme_name: str, index_name: str = None):
+            """获取投影统计"""
+            if index_name and index_name in self.mbtree_indices:
+                try:
+                    return self.mbtree_indices[index_name]['index'].get_projection_stats(scheme_name)
+                except Exception as e:
+                    logging.error(f"获取索引 '{index_name}' 投影统计失败: {e}")
+                    return None
+            else:
+                # 合并所有索引的统计
+                combined_stats = {}
+                for name, mbtree_info in self.mbtree_indices.items():
+                    try:
+                        stats = mbtree_info['index'].get_projection_stats(scheme_name)
+                        if stats:
+                            combined_stats[f"{name}_stats"] = stats
+                    except Exception as e:
+                        logging.error(f"获取索引 '{name}' 投影统计失败: {e}")
+                return combined_stats if combined_stats else None
+
+        def get_projections_for_key(self, key, index_name: str = None):
+            """获取指定键的所有投影"""
+            if index_name and index_name in self.mbtree_indices:
+                try:
+                    return self.mbtree_indices[index_name]['index'].get_projections_for_key(key)
+                except Exception as e:
+                    logging.error(f"获取索引 '{index_name}' 键投影失败: {e}")
+                    return {}
+            else:
+                # 从第一个索引获取
+                if self.mbtree_indices:
+                    first_index = next(iter(self.mbtree_indices.values()))
+                    try:
+                        return first_index['index'].get_projections_for_key(key)
+                    except Exception as e:
+                        logging.error(f"获取键投影失败: {e}")
+                return {}
+
+        # ========== 投影平面管理 ==========
+
+        def create_projection_plane(self, plane_name: str, enable_smart_indexing: bool = True, index_name: str = None):
+            """创建投影平面"""
+            if not MBTREE_AVAILABLE:
+                raise ImportError("mbtree模块不可用")
+            
+            with self.lock:
+                if index_name and index_name in self.mbtree_indices:
+                    # 在特定索引上创建投影平面
+                    try:
+                        return self.mbtree_indices[index_name]['index'].create_projection_plane(plane_name, enable_smart_indexing)
+                    except Exception as e:
+                        logging.error(f"在索引 '{index_name}' 创建投影平面失败: {e}")
+                        return None
+                else:
+                    # 在所有索引上创建投影平面
+                    success_count = 0
+                    last_plane = None
+                    for name, mbtree_info in self.mbtree_indices.items():
+                        try:
+                            plane = mbtree_info['index'].create_projection_plane(plane_name, enable_smart_indexing)
+                            if plane:
+                                success_count += 1
+                                last_plane = plane
+                        except Exception as e:
+                            logging.error(f"在索引 '{name}' 创建投影平面失败: {e}")
+                    
+                    return last_plane if success_count > 0 else None
+
+        def get_projection_plane(self, plane_name: str, index_name: str = None):
+            """获取投影平面"""
+            if index_name and index_name in self.mbtree_indices:
+                try:
+                    return self.mbtree_indices[index_name]['index'].get_projection_plane(plane_name)
+                except Exception as e:
+                    logging.error(f"获取索引 '{index_name}' 投影平面失败: {e}")
+                    return None
+            else:
+                # 从第一个索引获取
+                if self.mbtree_indices:
+                    first_index = next(iter(self.mbtree_indices.values()))
+                    try:
+                        return first_index['index'].get_projection_plane(plane_name)
+                    except Exception as e:
+                        logging.error(f"获取投影平面失败: {e}")
+                return None
+
+        def remove_projection_plane(self, plane_name: str, index_name: str = None):
+            """删除投影平面"""
+            with self.lock:
+                if index_name and index_name in self.mbtree_indices:
+                    try:
+                        return self.mbtree_indices[index_name]['index'].remove_projection_plane(plane_name)
+                    except Exception as e:
+                        logging.error(f"删除索引 '{index_name}' 投影平面失败: {e}")
+                        return False
+                else:
+                    # 从所有索引删除
+                    success_count = 0
+                    for name, mbtree_info in self.mbtree_indices.items():
+                        try:
+                            if mbtree_info['index'].remove_projection_plane(plane_name):
+                                success_count += 1
+                        except Exception as e:
+                            logging.error(f"删除索引 '{name}' 投影平面失败: {e}")
+                    
+                    return success_count > 0
+
+        def list_projection_planes(self, index_name: str = None):
+            """列出所有投影平面"""
+            if index_name and index_name in self.mbtree_indices:
+                try:
+                    return self.mbtree_indices[index_name]['index'].list_projection_planes()
+                except Exception as e:
+                    logging.error(f"列出索引 '{index_name}' 投影平面失败: {e}")
+                    return []
+            else:
+                # 从第一个索引获取
+                if self.mbtree_indices:
+                    first_index = next(iter(self.mbtree_indices.values()))
+                    try:
+                        return first_index['index'].list_projection_planes()
+                    except Exception as e:
+                        logging.error(f"列出投影平面失败: {e}")
+                return []
+
+        def create_projection_on_plane(self, plane_name: str, projection_key: str, 
+                                    data_selector: Callable, indexing_strategy: str = 'auto', 
+                                    index_name: str = None):
+            """在投影平面上创建投影"""
+            if index_name and index_name in self.mbtree_indices:
+                try:
+                    return self.mbtree_indices[index_name]['index'].create_projection_on_plane(
+                        plane_name, projection_key, data_selector, indexing_strategy)
+                except Exception as e:
+                    logging.error(f"在索引 '{index_name}' 投影平面创建投影失败: {e}")
+                    return False
+            else:
+                # 在所有索引的投影平面上创建
+                success_count = 0
+                for name, mbtree_info in self.mbtree_indices.items():
+                    try:
+                        if mbtree_info['index'].create_projection_on_plane(
+                            plane_name, projection_key, data_selector, indexing_strategy):
+                            success_count += 1
+                    except Exception as e:
+                        logging.error(f"在索引 '{name}' 投影平面创建投影失败: {e}")
+                
+                return success_count > 0
+
+        def query_projection_plane(self, plane_name: str, projection_key: str, 
+                                query_conditions: Dict[str, Any], index_name: str = None):
+            """查询投影平面"""
+            results = []
+            
+            if index_name and index_name in self.mbtree_indices:
+                try:
+                    return self.mbtree_indices[index_name]['index'].query_projection_plane(
+                        plane_name, projection_key, query_conditions)
+                except Exception as e:
+                    logging.error(f"查询索引 '{index_name}' 投影平面失败: {e}")
+                    return []
+            else:
+                # 查询所有索引的投影平面
+                for name, mbtree_info in self.mbtree_indices.items():
+                    try:
+                        plane_results = mbtree_info['index'].query_projection_plane(
+                            plane_name, projection_key, query_conditions)
+                        results.extend(plane_results)
+                    except Exception as e:
+                        logging.error(f"查询索引 '{name}' 投影平面失败: {e}")
+                
+                return results
+
+        def update_projection_on_plane(self, plane_name: str, projection_key: str, index_name: str = None):
+            """更新投影平面上的投影"""
+            if index_name and index_name in self.mbtree_indices:
+                try:
+                    return self.mbtree_indices[index_name]['index'].update_projection_on_plane(
+                        plane_name, projection_key)
+                except Exception as e:
+                    logging.error(f"更新索引 '{index_name}' 投影平面失败: {e}")
+                    return False
+            else:
+                # 更新所有索引的投影平面
+                success_count = 0
+                for name, mbtree_info in self.mbtree_indices.items():
+                    try:
+                        if mbtree_info['index'].update_projection_on_plane(plane_name, projection_key):
+                            success_count += 1
+                    except Exception as e:
+                        logging.error(f"更新索引 '{name}' 投影平面失败: {e}")
+                
+                return success_count > 0
+
+        def optimize_projection_planes(self, index_name: str = None):
+            """优化投影平面"""
+            if index_name and index_name in self.mbtree_indices:
+                try:
+                    self.mbtree_indices[index_name]['index'].optimize_projection_planes()
+                    return True
+                except Exception as e:
+                    logging.error(f"优化索引 '{index_name}' 投影平面失败: {e}")
+                    return False
+            else:
+                # 优化所有索引的投影平面
+                success_count = 0
+                for name, mbtree_info in self.mbtree_indices.items():
+                    try:
+                        mbtree_info['index'].optimize_projection_planes()
+                        success_count += 1
+                    except Exception as e:
+                        logging.error(f"优化索引 '{name}' 投影平面失败: {e}")
+                
+                return success_count == len(self.mbtree_indices)
+
+        def get_projection_plane_stats(self, plane_name: str, index_name: str = None):
+            """获取投影平面统计"""
+            if index_name and index_name in self.mbtree_indices:
+                try:
+                    return self.mbtree_indices[index_name]['index'].get_projection_plane_stats(plane_name)
+                except Exception as e:
+                    logging.error(f"获取索引 '{index_name}' 投影平面统计失败: {e}")
+                    return None
+            else:
+                # 从第一个索引获取
+                if self.mbtree_indices:
+                    first_index = next(iter(self.mbtree_indices.values()))
+                    try:
+                        return first_index['index'].get_projection_plane_stats(plane_name)
+                    except Exception as e:
+                        logging.error(f"获取投影平面统计失败: {e}")
+                return None
+
+        def get_all_projection_planes_stats(self, index_name: str = None):
+            """获取所有投影平面统计"""
+            if index_name and index_name in self.mbtree_indices:
+                try:
+                    return self.mbtree_indices[index_name]['index'].get_all_projection_planes_stats()
+                except Exception as e:
+                    logging.error(f"获取索引 '{index_name}' 所有投影平面统计失败: {e}")
+                    return {}
+            else:
+                # 从第一个索引获取
+                if self.mbtree_indices:
+                    first_index = next(iter(self.mbtree_indices.values()))
+                    try:
+                        return first_index['index'].get_all_projection_planes_stats()
+                    except Exception as e:
+                        logging.error(f"获取所有投影平面统计失败: {e}")
+                return {}
+
+        # ========== 高级投影功能 ==========
+
+        def create_smart_projection(self, plane_name: str, projection_key: str, 
+                                field_extractors: Dict[str, Callable], 
+                                indexing_strategy: str = 'auto', index_name: str = None):
+            """创建智能投影"""
+            if index_name and index_name in self.mbtree_indices:
+                try:
+                    return self.mbtree_indices[index_name]['index'].create_smart_projection(
+                        plane_name, projection_key, field_extractors, indexing_strategy)
+                except Exception as e:
+                    logging.error(f"在索引 '{index_name}' 创建智能投影失败: {e}")
+                    return False
+            else:
+                # 在所有索引上创建智能投影
+                success_count = 0
+                for name, mbtree_info in self.mbtree_indices.items():
+                    try:
+                        if mbtree_info['index'].create_smart_projection(
+                            plane_name, projection_key, field_extractors, indexing_strategy):
+                            success_count += 1
+                    except Exception as e:
+                        logging.error(f"在索引 '{name}' 创建智能投影失败: {e}")
+                
+                return success_count > 0
+
+        def query_projection_with_aggregation(self, plane_name: str, projection_key: str,
+                                            query_conditions: Dict[str, Any],
+                                            aggregation_func: Callable = None, 
+                                            index_name: str = None):
+            """带聚合的投影查询"""
+            if index_name and index_name in self.mbtree_indices:
+                try:
+                    return self.mbtree_indices[index_name]['index'].query_projection_with_aggregation(
+                        plane_name, projection_key, query_conditions, aggregation_func)
+                except Exception as e:
+                    logging.error(f"在索引 '{index_name}' 聚合投影查询失败: {e}")
+                    return None
+            else:
+                # 在第一个索引上执行聚合查询
+                if self.mbtree_indices:
+                    first_index = next(iter(self.mbtree_indices.values()))
+                    try:
+                        return first_index['index'].query_projection_with_aggregation(
+                            plane_name, projection_key, query_conditions, aggregation_func)
+                    except Exception as e:
+                        logging.error(f"聚合投影查询失败: {e}")
+                return None
         # =======================MBTree表达式查询支持========================================
 
     class MBTreeExpression:
@@ -5321,7 +5845,8 @@ class ION(BTreeMixin,MBTreeMixin,metaclass=MLInterceptorMeta):
             
             # 转换回列表返回
             return set(unique_nodes)
-
+        
+    
     def __init__(self, start=None, size=1024, max_workers=4, load_factor_threshold=0.75, 
                 enable_memory_optimization=False, index_type="hash", cache_strategy="none", 
                 memory_limit_mb=None, persistence_enabled=False, persistence_path=None,
@@ -5735,6 +6260,7 @@ class ION(BTreeMixin,MBTreeMixin,metaclass=MLInterceptorMeta):
             except RuntimeError:
                 # 如果没有事件循环，创建一个
                 asyncio.set_event_loop(asyncio.new_event_loop())
+        self.init_async_task() # 初始化异步任务管理器
     def _register_builtin_sync_handlers(self):
         """注册内置的同步处理器示例"""
         if not self.sync_manager:
