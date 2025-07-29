@@ -9,10 +9,10 @@ your_ion {
     ion.py # 拷贝后的ion.py
     config.json #设置
     __init_ion_other__.py #ion 项目设置
-    __version__.py # 只要有__ion_verion__（你所使用的ion版本）和__version__(你的版本) 就行了（也可以直接定义在__init_ion_other__.py）
-    certify # 无后缀名，获取途径:开发者给你 开头:\x11\x45\x14就是 有了它你的建议会被开发者采纳，需要通过验证(开发中)
+    __version__.py # 只要有__ion_verion__（你所使用的ion版本）和__version__(你的版本) 就行了（也可以直接定义在__init_ion_other__.py）（没有也可以）
+    
 }
-最后你只需要导入your_ion.ion就可以使用你的ion.py了
+最后你只需要导入your_ion/ion就可以使用你的ion.py了
 ```
 
 ### ion.py
@@ -43,7 +43,7 @@ init_ion_handle = IndexingHandlerGenerator.generate_custom_handler(
 )
 
 class IONMixin(BaseMixin, ...):
-    ... # 这里的Mixin你可以根据你选择的Minin基类来创作
+    ... # 这里的Mixin你可以根据你选择的Mixin基类来创作
 ```
 
 ### `__version__.py` 这是你标注版本的文件，很简单
@@ -52,10 +52,6 @@ __version__="你的版本"
 __ion_version__="你所使用的ion.py的版本，最近版0.8.4,最稳定版0.8.1" 
 
 ```
-
-### `cerify`
-这个文件如果你的项目有了，可以把它打包成zip文件然后发到43.136.122.67:5003/commit_zip 这样最新版的ion.py就会采纳你的建议
-当然，如果你没有，你的项目也合法，因为ion.py是开源的
 
 ### `config.json`
 ```json
